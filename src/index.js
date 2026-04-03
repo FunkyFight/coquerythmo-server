@@ -70,15 +70,18 @@ io.on('connection', (socket) => {
   // --- Command broadcast ---
   socket.on('command', (data) => {
     const room = getRoom(socket);
-    if (!room) {
-      console.log(`[cmd] REJECTED - ${socket.id} not in a room (roomCode: ${socket.roomCode}, username: ${socket.username})`);
-      return socket.emit('server_error', { message: 'Not in a room' });
-    }
-    console.log(`[cmd] ${socket.username} -> ${data?.payload?.cmd || 'unknown'}`);
+    if (!room) return socket.emit('server_error', { message: 'Not in a room' });
     socket.to(room.code).emit('remote_command', {
       from: socket.username,
       payload: data.payload,
     });
+  });
+
+  // Delta: lightweight command relay
+  socket.on('delta', (data) => {
+    const room = getRoom(socket);
+    if (!room) return;
+    socket.to(room.code).emit('delta', data);
   });
 
   // --- Sync request ---
