@@ -80,29 +80,33 @@ io.on('connection', (socket) => {
   // --- Sync request ---
   socket.on('request_sync', () => {
     const room = getRoom(socket);
-    if (!room) {
-      console.log('[sync] request_sync but not in a room');
-      return socket.emit('server_error', { message: 'Not in a room' });
-    }
-    console.log(`[sync] ${socket.username} requests sync from room ${room.code} (${room.members.size} members)`);
-    let sent = false;
+    if (!room) return socket.emit('server_error', { message: 'Not in a room' });
+    console.log(`[sync] ${socket.username} requests sync`);
+    // Ask admin to send fresh sync
     for (const [memberSocket, member] of room.members) {
       if (member.role === 'admin' && memberSocket !== socket) {
-        console.log(`[sync] Forwarding request_sync to admin: ${member.username}`);
-        memberSocket.emit('request_sync');
-        sent = true;
-        break;
+        console.log(`[sync] Asking admin ${member.username} to send sync`);
+        // Tell admin who needs the sync
+        memberSocket.emit('request_sync', { requester: socket.id });
+        return;
       }
     }
-    if (!sent) console.log('[sync] No admin found to forward request_sync');
+    console.log('[sync] No admin found');
   });
 
-  // --- Sync data (admin -> all) ---
+  // --- Sync data (admin -> specific requester or broadcast) ---
   socket.on('sync', (data) => {
     const room = getRoom(socket);
     if (!room) return;
-    console.log(`[sync] ${socket.username} sending sync data to room ${room.code}`);
-    socket.to(room.code).emit('sync', data);
+    console.log(`[sync] ${socket.username} sent sync data`);
+    // If targeted to a specific requester, send only to them
+    if (data._target) {
+      const target = data._target;
+      delete data._target;
+      io.to(target).emit('sync', data);
+    } else {
+      socket.to(room.code).emit('sync', data);
+    }
   });
 
   // --- Chunked video relay ---

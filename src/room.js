@@ -13,6 +13,7 @@ class Room {
   constructor(code, adminSocket, adminUsername) {
     this.code = code;
     this.members = new Map(); // socket -> { username, role }
+    this.lastSync = null; // cached project data for new joiners
     this.addMember(adminSocket, adminUsername, 'admin');
   }
 
