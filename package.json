@@ -1,0 +1,13 @@
+{
+  "name": "coquerythmo-server",
+  "version": "1.0.0",
+  "description": "WebSocket server for coquerythmo cooperative mode",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.7.5",
+    "dotenv": "^16.4.5"
+  }
+}
