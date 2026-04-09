@@ -55,7 +55,14 @@ io.on('connection', (socket) => {
       max_slots: MAX_SLOTS,
       online: connectedClients,
       rooms: rooms.size,
+    }, () => {
+      // Disconnect after ack (if client supports it)
+      socket.disconnect(true);
     });
+    // Also disconnect after a short delay in case no ack
+    setTimeout(() => {
+      if (socket.connected) socket.disconnect(true);
+    }, 500);
   });
 
   // --- Create room ---
