@@ -2,9 +2,13 @@ require('dotenv').config();
 
 const { Server } = require('socket.io');
 const { validatePassword } = require('./auth');
-const { createRoom, joinRoom, leaveRoom, getRoom } = require('./room');
+const { createRoom, joinRoom, leaveRoom, getRoom, rooms } = require('./room');
 
 const PORT = parseInt(process.env.PORT || '9050', 10);
+const SERVER_NAME = process.env.SERVER_NAME || 'Coquerythmo Server';
+const MAX_SLOTS = parseInt(process.env.MAX_SLOTS || '20', 10);
+const MOTD = process.env.MOTD || '';
+const INACTIVITY_TIMEOUT = 15 * 60 * 1000; // 15 minutes
 
 const io = new Server(PORT, {
   cors: { origin: '*' },
@@ -13,10 +17,8 @@ const io = new Server(PORT, {
 
 // --- Auth via middleware (handshake) ---
 io.use((socket, next) => {
-  console.log('[auth] handshake.auth:', JSON.stringify(socket.handshake.auth));
   const password = socket.handshake.auth?.password ?? '';
   if (validatePassword(password)) {
-    console.log('[auth] Client authenticated:', socket.id);
     next();
   } else {
     console.log('[auth] Client rejected:', socket.id);
@@ -25,9 +27,10 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
-  console.log('[connect] Authenticated client:', socket.id);
+  console.log('[connect] Client:', socket.id);
   socket.username = null;
   socket.roomCode = null;
+  socket.lastActivity = Date.now();
 
   if (process.env.DEBUG) {
     socket.onAny((event, ...args) => {
@@ -35,10 +38,35 @@ io.on('connection', (socket) => {
     });
   }
 
+  // Reset inactivity timer on any incoming event
+  socket.onAny(() => {
+    socket.lastActivity = Date.now();
+  });
+
+  // --- Server info (ping) ---
+  socket.on('ping_server', () => {
+    let connectedClients = 0;
+    for (const [, room] of rooms) {
+      connectedClients += room.members.size;
+    }
+    socket.emit('server_info', {
+      name: SERVER_NAME,
+      motd: MOTD,
+      max_slots: MAX_SLOTS,
+      online: connectedClients,
+      rooms: rooms.size,
+    });
+  });
+
   // --- Create room ---
   socket.on('create_room', (data) => {
     if (!data || typeof data.username !== 'string' || !data.username.trim()) return;
     if (socket.roomCode) return socket.emit('server_error', { message: 'Already in a room' });
+
+    // Check slot limit
+    let total = 0;
+    for (const [, room] of rooms) total += room.members.size;
+    if (total >= MAX_SLOTS) return socket.emit('server_error', { message: 'Server is full' });
 
     const username = data.username.trim().substring(0, 32);
     socket.username = username;
@@ -98,11 +126,9 @@ io.on('connection', (socket) => {
     const room = getRoom(socket);
     if (!room) return socket.emit('server_error', { message: 'Not in a room' });
     console.log(`[sync] ${socket.username} requests sync`);
-    // Ask admin to send fresh sync
     for (const [memberSocket, member] of room.members) {
       if (member.role === 'admin' && memberSocket !== socket) {
         console.log(`[sync] Asking admin ${member.username} to send sync`);
-        // Tell admin who needs the sync
         memberSocket.emit('request_sync', { requester: socket.id });
         return;
       }
@@ -115,7 +141,6 @@ io.on('connection', (socket) => {
     const room = getRoom(socket);
     if (!room) return;
     console.log(`[sync] ${socket.username} sent sync data`);
-    // If targeted to a specific requester, send only to them
     if (data._target) {
       const target = data._target;
       delete data._target;
@@ -164,4 +189,17 @@ function handleLeave(socket) {
   }
 }
 
-console.log(`coquerythmo server listening on port ${PORT}`);
+// --- Inactivity check: disconnect clients idle for 15 minutes ---
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, socket] of io.sockets.sockets) {
+    if (now - socket.lastActivity > INACTIVITY_TIMEOUT) {
+      console.log(`[timeout] Disconnecting idle client: ${socket.username || socket.id}`);
+      socket.emit('server_error', { message: 'Disconnected: 15 minutes of inactivity' });
+      handleLeave(socket);
+      socket.disconnect(true);
+    }
+  }
+}, 60 * 1000); // check every minute
+
+console.log(`${SERVER_NAME} listening on port ${PORT} (max ${MAX_SLOTS} slots)`);
