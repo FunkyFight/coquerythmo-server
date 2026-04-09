@@ -29,27 +29,34 @@ io.on('connection', (socket) => {
   socket.username = null;
   socket.roomCode = null;
 
-  socket.onAny((event, ...args) => {
-    console.log(`[event] ${socket.id} -> ${event}`, JSON.stringify(args).substring(0, 200));
-  });
+  if (process.env.DEBUG) {
+    socket.onAny((event, ...args) => {
+      console.log(`[event] ${socket.id} -> ${event}`, JSON.stringify(args).substring(0, 200));
+    });
+  }
 
   // --- Create room ---
   socket.on('create_room', (data) => {
+    if (!data || typeof data.username !== 'string' || !data.username.trim()) return;
     if (socket.roomCode) return socket.emit('server_error', { message: 'Already in a room' });
 
-    socket.username = data.username;
-    const room = createRoom(socket, data.username);
+    const username = data.username.trim().substring(0, 32);
+    socket.username = username;
+    const room = createRoom(socket, username);
     socket.join(room.code);
     socket.emit('room_created', { code: room.code });
-    console.log(`[room] ${data.username} created room ${room.code}`);
+    console.log(`[room] ${username} created room ${room.code}`);
   });
 
   // --- Join room ---
   socket.on('join_room', (data) => {
+    if (!data || typeof data.username !== 'string' || typeof data.code !== 'string') return;
     if (socket.roomCode) return socket.emit('server_error', { message: 'Already in a room' });
 
-    socket.username = data.username;
-    const room = joinRoom(socket, data.code, data.username);
+    const username = data.username.trim().substring(0, 32);
+    const code = data.code.trim().toUpperCase();
+    socket.username = username;
+    const room = joinRoom(socket, code, username);
     if (!room) return socket.emit('join_error', { reason: 'Room not found' });
 
     socket.join(room.code);
@@ -58,8 +65,8 @@ io.on('connection', (socket) => {
       role: 'user',
       members: room.getMemberUsernames(),
     });
-    socket.to(room.code).emit('member_joined', { username: data.username });
-    console.log(`[room] ${data.username} joined room ${data.code}`);
+    socket.to(room.code).emit('member_joined', { username });
+    console.log(`[room] ${username} joined room ${code}`);
   });
 
   // --- Leave room ---
@@ -69,6 +76,7 @@ io.on('connection', (socket) => {
 
   // --- Command broadcast ---
   socket.on('command', (data) => {
+    if (!data || typeof data.payload !== 'object') return;
     const room = getRoom(socket);
     if (!room) return socket.emit('server_error', { message: 'Not in a room' });
     socket.to(room.code).emit('remote_command', {
@@ -79,6 +87,7 @@ io.on('connection', (socket) => {
 
   // Delta: lightweight command relay
   socket.on('delta', (data) => {
+    if (!data) return;
     const room = getRoom(socket);
     if (!room) return;
     socket.to(room.code).emit('delta', data);
@@ -118,6 +127,7 @@ io.on('connection', (socket) => {
 
   // --- Chunked video relay ---
   socket.on('video_start', (data) => {
+    if (!data || typeof data.filename !== 'string' || typeof data.total_chunks !== 'number') return;
     const room = getRoom(socket);
     if (!room) return;
     console.log(`[video] ${socket.username} sending video: ${data.filename} (${data.total_chunks} chunks)`);
@@ -125,6 +135,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('video_chunk', (data) => {
+    if (!data || data.index === undefined) return;
     const room = getRoom(socket);
     if (!room) return;
     socket.to(room.code).emit('video_chunk', data);

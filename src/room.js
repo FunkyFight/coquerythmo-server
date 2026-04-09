@@ -13,7 +13,6 @@ class Room {
   constructor(code, adminSocket, adminUsername) {
     this.code = code;
     this.members = new Map(); // socket -> { username, role }
-    this.lastSync = null; // cached project data for new joiners
     this.addMember(adminSocket, adminUsername, 'admin');
   }
 
@@ -83,8 +82,4 @@ function getRoom(socket) {
   return code ? rooms.get(code) : null;
 }
 
-function sendTo(socket, event, data) {
-  try { socket.emit(event, data); } catch (_) {}
-}
-
-module.exports = { createRoom, joinRoom, leaveRoom, getRoom, sendTo, rooms };
+module.exports = { createRoom, joinRoom, leaveRoom, getRoom, rooms };
