@@ -1,3 +1,5 @@
+const { isDeepStrictEqual } = require('node:util');
+
 const AUDIO_CHUNK_MAX_BYTES = 256 * 1024;
 const AUDIO_MAX_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_RECORDING_TRANSACTION_BYTES = 4 * 1024 * 1024;
@@ -114,8 +116,8 @@ function rustJsonStringify(value, floatValue = false) {
   throw new Error('unsupported JSON value');
 }
 
-function transactionIntegrity(sequence, previousIntegrity, operation) {
-  const serialized = Buffer.from(rustJsonStringify(operation), 'utf8');
+function transactionIntegrity(sequence, previousIntegrity, operation, operationJson) {
+  const serialized = Buffer.from(operationJson ?? rustJsonStringify(operation), 'utf8');
   let hash = 0xcbf29ce484222325n;
   for (const byte of [
     ...littleEndianBytes(sequence),
@@ -225,7 +227,8 @@ function validateRecordingTransaction(transaction, expected) {
 
   let serialized;
   try {
-    serialized = JSON.stringify(transaction);
+    const { operation_json: operationJson, ...logicalTransaction } = transaction;
+    serialized = JSON.stringify(logicalTransaction);
   } catch (error) {
     return { error: `recording transaction is not serializable: ${error.message}` };
   }
@@ -235,10 +238,28 @@ function validateRecordingTransaction(transaction, expected) {
 
   let expectedIntegrity;
   try {
+    let operationJson;
+    if (transaction.operation_json !== undefined) {
+      if (typeof transaction.operation_json !== 'string'
+        || Buffer.byteLength(transaction.operation_json, 'utf8') > MAX_RECORDING_TRANSACTION_BYTES) {
+        return { error: 'recording transaction operation JSON is invalid or too large' };
+      }
+      let parsedOperation;
+      try {
+        parsedOperation = JSON.parse(transaction.operation_json);
+      } catch (error) {
+        return { error: `recording transaction operation JSON is invalid: ${error.message}` };
+      }
+      if (!isDeepStrictEqual(parsedOperation, transaction.operation)) {
+        return { error: 'recording transaction operation JSON mismatch' };
+      }
+      operationJson = transaction.operation_json;
+    }
     expectedIntegrity = transactionIntegrity(
       transaction.sequence,
       transaction.previous_integrity,
       transaction.operation,
+      operationJson,
     );
   } catch (error) {
     return { error: `recording transaction integrity cannot be computed: ${error.message}` };

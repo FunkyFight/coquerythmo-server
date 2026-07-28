@@ -163,6 +163,34 @@ test('recording integrity is stable after serde_json wire key ordering', () => {
   assert.equal(transaction.integrity, '9c2bd6c5639daea0');
 });
 
+test('recording integrity uses the canonical Rust operation JSON carried on the wire', () => {
+  const operation = {
+    op: 'add_track',
+    track: { id: 1, name: 'Comédien', muted: false, solo: false, armed: false },
+  };
+  const operationJson = JSON.stringify(operation);
+  const wireOperation = {
+    op: 'add_track',
+    track: { armed: false, id: 1, muted: false, name: 'Comédien', solo: false },
+  };
+  const tx = {
+    sequence: 0,
+    previous_integrity: ZERO_INTEGRITY,
+    integrity: transactionIntegrity(0, ZERO_INTEGRITY, operation, operationJson),
+    operation: wireOperation,
+    operation_json: operationJson,
+  };
+
+  assert.equal(validateRecordingTransaction(tx).error, undefined);
+  assert.match(
+    validateRecordingTransaction({
+      ...tx,
+      operation: { ...wireOperation, track: { ...wireOperation.track, name: 'Tampered' } },
+    }).error,
+    /operation JSON mismatch/,
+  );
+});
+
 test('recording prepare validates the complete log and returns its active tail', () => {
   const first = transaction(0, ZERO_INTEGRITY);
   const second = transaction(1, first.integrity, {
