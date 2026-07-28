@@ -1,5 +1,3 @@
-const { isDeepStrictEqual } = require('node:util');
-
 const AUDIO_CHUNK_MAX_BYTES = 256 * 1024;
 const AUDIO_MAX_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_RECORDING_TRANSACTION_BYTES = 4 * 1024 * 1024;
@@ -23,34 +21,6 @@ const KNOWN_OPERATIONS = new Set([
   'delete_clips',
 ]);
 
-// `NetworkClient::send_raw` serializes a serde_json::Value. With the default
-// serde_json map implementation that second serialization orders object keys
-// lexicographically, while the FNV chain was computed from the original Rust
-// struct order. Rebuild that order from the wire shape before hashing.
-const OPERATION_FIELDS = {
-  batch: ['op', 'operations'],
-  add_asset: ['op', 'asset'],
-  remove_asset: ['op', 'asset_id'],
-  add_track: ['op', 'track'],
-  remove_track: ['op', 'track_id'],
-  rename_track: ['op', 'track_id', 'name'],
-  set_track_muted: ['op', 'track_id', 'muted'],
-  set_track_solo: ['op', 'track_id', 'solo'],
-  arm_track: ['op', 'track_id'],
-  add_clip: ['op', 'clip'],
-  move_clips: ['op', 'placements'],
-  split_clip: ['op', 'clip_id', 'at_frame', 'right_clip_id'],
-  delete_clips: ['op', 'clip_ids'],
-};
-
-const STRUCT_FIELDS = [
-  ['id', 'name', 'muted', 'solo', 'armed'],
-  ['id', 'file_name', 'sample_rate', 'channels', 'sample_count', 'checksum', 'waveform'],
-  ['samples_per_peak', 'peaks'],
-  ['id', 'asset_id', 'track_id', 'start_frame', 'source_start_frame', 'duration_frames'],
-  ['clip_id', 'track_id', 'start_frame'],
-];
-
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -61,72 +31,6 @@ function isSafeNonNegativeInteger(value) {
 
 function isHexIntegrity(value) {
   return typeof value === 'string' && /^[a-f0-9]{16}$/.test(value);
-}
-
-function parseIntegrity(value) {
-  return BigInt(`0x${value}`);
-}
-
-function integrityHex(value) {
-  return value.toString(16).padStart(16, '0');
-}
-
-function fnvByte(hash, byte) {
-  return ((hash ^ BigInt(byte)) * 0x00000100000001b3n) & 0xffffffffffffffffn;
-}
-
-function littleEndianBytes(value) {
-  const bytes = [];
-  let remaining = BigInt(value);
-  for (let index = 0; index < 8; index += 1) {
-    bytes.push(Number(remaining & 0xffn));
-    remaining >>= 8n;
-  }
-  return bytes;
-}
-
-function rustJsonStringify(value, floatValue = false) {
-  if (value === null) return 'null';
-  if (typeof value === 'string') return JSON.stringify(value);
-  if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new Error('non-finite number');
-    if (floatValue && Number.isInteger(value)) {
-      return Object.is(value, -0) ? '-0.0' : `${value}.0`;
-    }
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(item => rustJsonStringify(item, floatValue)).join(',')}]`;
-  }
-  if (isObject(value)) {
-    const keys = Object.keys(value);
-    const operationFields = typeof value.op === 'string' ? OPERATION_FIELDS[value.op] : null;
-    const structFields = STRUCT_FIELDS.find(fields =>
-      fields.length === keys.length && fields.every(field => keys.includes(field)));
-    const orderedKeys = operationFields
-      ? [...operationFields, ...keys.filter(key => !operationFields.includes(key))]
-      : structFields
-        ? [...structFields, ...keys.filter(key => !structFields.includes(key))]
-        : keys;
-    return `{${orderedKeys
-      .map(key => `${JSON.stringify(key)}:${rustJsonStringify(value[key], key === 'peaks')}`)
-      .join(',')}}`;
-  }
-  throw new Error('unsupported JSON value');
-}
-
-function transactionIntegrity(sequence, previousIntegrity, operation, operationJson) {
-  const serialized = Buffer.from(operationJson ?? rustJsonStringify(operation), 'utf8');
-  let hash = 0xcbf29ce484222325n;
-  for (const byte of [
-    ...littleEndianBytes(sequence),
-    ...littleEndianBytes(parseIntegrity(previousIntegrity)),
-    ...serialized,
-  ]) {
-    hash = fnvByte(hash, byte);
-  }
-  return integrityHex(hash);
 }
 
 function requiredField(operation, field, predicate) {
@@ -213,6 +117,7 @@ function validateOperation(operation, depth = 0) {
 }
 
 function validateRecordingTransaction(transaction, expected) {
+  // Rust peers verify the operation hash; the relay owns bounds and ordering.
   if (!isObject(transaction)) return { error: 'recording transaction must be an object' };
   if (!isSafeNonNegativeInteger(transaction.sequence)) {
     return { error: 'recording transaction sequence is invalid' };
@@ -227,45 +132,12 @@ function validateRecordingTransaction(transaction, expected) {
 
   let serialized;
   try {
-    const { operation_json: operationJson, ...logicalTransaction } = transaction;
-    serialized = JSON.stringify(logicalTransaction);
+    serialized = JSON.stringify(transaction);
   } catch (error) {
     return { error: `recording transaction is not serializable: ${error.message}` };
   }
   if (Buffer.byteLength(serialized, 'utf8') > MAX_RECORDING_TRANSACTION_BYTES) {
     return { error: 'recording transaction is too large' };
-  }
-
-  let expectedIntegrity;
-  try {
-    let operationJson;
-    if (transaction.operation_json !== undefined) {
-      if (typeof transaction.operation_json !== 'string'
-        || Buffer.byteLength(transaction.operation_json, 'utf8') > MAX_RECORDING_TRANSACTION_BYTES) {
-        return { error: 'recording transaction operation JSON is invalid or too large' };
-      }
-      let parsedOperation;
-      try {
-        parsedOperation = JSON.parse(transaction.operation_json);
-      } catch (error) {
-        return { error: `recording transaction operation JSON is invalid: ${error.message}` };
-      }
-      if (!isDeepStrictEqual(parsedOperation, transaction.operation)) {
-        return { error: 'recording transaction operation JSON mismatch' };
-      }
-      operationJson = transaction.operation_json;
-    }
-    expectedIntegrity = transactionIntegrity(
-      transaction.sequence,
-      transaction.previous_integrity,
-      transaction.operation,
-      operationJson,
-    );
-  } catch (error) {
-    return { error: `recording transaction integrity cannot be computed: ${error.message}` };
-  }
-  if (transaction.integrity !== expectedIntegrity) {
-    return { error: 'recording transaction integrity mismatch' };
   }
 
   if (expected) {
@@ -405,7 +277,6 @@ module.exports = {
   decodeCanonicalBase64,
   expiredTransferIds,
   relayAudio,
-  transactionIntegrity,
   validateAudioChunk,
   validateAudioStart,
   validateRecordingLog,

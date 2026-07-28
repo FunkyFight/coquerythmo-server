@@ -3,7 +3,6 @@ const assert = require('node:assert/strict');
 
 const {
   relayAudio,
-  transactionIntegrity,
   expiredTransferIds,
   validateAudioChunk,
   validateAudioStart,
@@ -24,7 +23,7 @@ function transaction(sequence, previousIntegrity, value = operation()) {
   return {
     sequence,
     previous_integrity: previousIntegrity,
-    integrity: transactionIntegrity(sequence, previousIntegrity, value),
+    integrity: (sequence + 1).toString(16).padStart(16, '0'),
     operation: value,
   };
 }
@@ -87,9 +86,8 @@ test('inactive audio transfers expire while active ones remain', () => {
   assert.deepEqual(expiredTransferIds(transfers, now, 300_000), ['stale']);
 });
 
-test('recording transaction integrity and chain ordering are enforced', () => {
+test('recording transaction shape and chain ordering are enforced', () => {
   const first = transaction(0, ZERO_INTEGRITY);
-  assert.equal(first.integrity, '0ff34a7be9210f12');
   const firstResult = validateRecordingTransaction(first, {
     nextSequence: 0,
     previousIntegrity: ZERO_INTEGRITY,
@@ -107,11 +105,18 @@ test('recording transaction integrity and chain ordering are enforced', () => {
     /sequence/,
   );
   assert.match(
-    validateRecordingTransaction({ ...first, integrity: '0'.repeat(16) }, {
+    validateRecordingTransaction({ ...first, integrity: 'INVALID' }, {
       nextSequence: 0,
       previousIntegrity: ZERO_INTEGRITY,
     }).error,
-    /integrity mismatch/,
+    /integrity fields/,
+  );
+  assert.match(
+    validateRecordingTransaction({ ...first, previous_integrity: 'f'.repeat(16) }, {
+      nextSequence: 0,
+      previousIntegrity: ZERO_INTEGRITY,
+    }).error,
+    /previous integrity/,
   );
   assert.match(
     validateRecordingTransaction({
@@ -119,75 +124,6 @@ test('recording transaction integrity and chain ordering are enforced', () => {
       operation: { op: 'not_an_operation' },
     }).error,
     /unknown recording operation/,
-  );
-});
-
-test('recording integrity matches Rust JSON for waveform float values', () => {
-  const addAsset = {
-    op: 'add_asset',
-    asset: {
-      id: 2,
-      file_name: 'take-2.flac',
-      sample_rate: 48000,
-      channels: 1,
-      sample_count: 96000,
-      checksum: '0000000000000000000000000000000000000002',
-      waveform: { samples_per_peak: 480, peaks: [0.1, 0.5, 1.0] },
-    },
-  };
-  assert.equal(
-    transactionIntegrity(0, ZERO_INTEGRITY, addAsset),
-    '38d43df7538f26bc',
-  );
-});
-
-test('recording integrity is stable after serde_json wire key ordering', () => {
-  const operation = {
-    op: 'add_clip',
-    clip: {
-      duration_frames: 24,
-      source_start_frame: 0,
-      track_id: 1,
-      asset_id: 2,
-      start_frame: 12,
-      id: 3,
-    },
-  };
-  const transaction = {
-    sequence: 0,
-    previous_integrity: ZERO_INTEGRITY,
-    integrity: transactionIntegrity(0, ZERO_INTEGRITY, operation),
-    operation,
-  };
-  assert.equal(validateRecordingTransaction(transaction).error, undefined);
-  assert.equal(transaction.integrity, '9c2bd6c5639daea0');
-});
-
-test('recording integrity uses the canonical Rust operation JSON carried on the wire', () => {
-  const operation = {
-    op: 'add_track',
-    track: { id: 1, name: 'Comédien', muted: false, solo: false, armed: false },
-  };
-  const operationJson = JSON.stringify(operation);
-  const wireOperation = {
-    op: 'add_track',
-    track: { armed: false, id: 1, muted: false, name: 'Comédien', solo: false },
-  };
-  const tx = {
-    sequence: 0,
-    previous_integrity: ZERO_INTEGRITY,
-    integrity: transactionIntegrity(0, ZERO_INTEGRITY, operation, operationJson),
-    operation: wireOperation,
-    operation_json: operationJson,
-  };
-
-  assert.equal(validateRecordingTransaction(tx).error, undefined);
-  assert.match(
-    validateRecordingTransaction({
-      ...tx,
-      operation: { ...wireOperation, track: { ...wireOperation.track, name: 'Tampered' } },
-    }).error,
-    /operation JSON mismatch/,
   );
 });
 
@@ -211,7 +147,7 @@ test('recording prepare validates the complete log and returns its active tail',
   });
 
   const corrupted = { ...log, entries: [{ ...first, previous_integrity: 'f'.repeat(16) }, second] };
-  assert.match(validateRecordingLog(corrupted).error, /previous integrity|integrity mismatch/);
+  assert.match(validateRecordingLog(corrupted).error, /previous integrity/);
 });
 
 test('recording batches are bounded', () => {

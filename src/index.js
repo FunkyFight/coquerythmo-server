@@ -214,14 +214,25 @@ io.on('connection', (socket) => {
   socket.on('recording_prepare', (data) => {
     const room = controlledRecordingRoom(socket);
     if (!room) return;
-    const validation = validateRecordingPrepare(data);
+    const target = data?._target;
+    if (target !== undefined
+      && (typeof target !== 'string' || !room.memberEntryById(target))) {
+      return socket.emit('server_error', { message: 'Invalid recording preparation target' });
+    }
+    const payload = { ...data };
+    delete payload._target;
+    const validation = validateRecordingPrepare(payload);
     if (validation.error) {
       return socket.emit('server_error', {
         message: `Invalid recording preparation: ${validation.error}`,
       });
     }
     room.setRecordingChain(validation.chain);
-    socket.to(room.code).emit('recording_prepare', data);
+    if (target !== undefined) {
+      io.to(target).emit('recording_prepare', payload);
+    } else {
+      socket.to(room.code).emit('recording_prepare', payload);
+    }
   });
 
   socket.on('recording_capture', (data) => {
