@@ -224,6 +224,16 @@ io.on('connection', (socket) => {
     socket.to(room.code).emit('recording_prepare', data);
   });
 
+  socket.on('recording_capture', (data) => {
+    const room = controlledRecordingRoom(socket);
+    if (!room) return;
+    if (!Number.isSafeInteger(data?.current_frame) || data.current_frame < 0
+      || (data.capture_target !== null && typeof data.capture_target !== 'object')) {
+      return socket.emit('server_error', { message: 'Invalid recording capture command' });
+    }
+    socket.to(room.code).emit('recording_capture', data);
+  });
+
   socket.on('recording_playback', (data) => {
     const room = controlledRecordingRoom(socket);
     if (!room) return;

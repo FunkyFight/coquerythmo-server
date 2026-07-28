@@ -141,6 +141,28 @@ test('recording integrity matches Rust JSON for waveform float values', () => {
   );
 });
 
+test('recording integrity is stable after serde_json wire key ordering', () => {
+  const operation = {
+    op: 'add_clip',
+    clip: {
+      duration_frames: 24,
+      source_start_frame: 0,
+      track_id: 1,
+      asset_id: 2,
+      start_frame: 12,
+      id: 3,
+    },
+  };
+  const transaction = {
+    sequence: 0,
+    previous_integrity: ZERO_INTEGRITY,
+    integrity: transactionIntegrity(0, ZERO_INTEGRITY, operation),
+    operation,
+  };
+  assert.equal(validateRecordingTransaction(transaction).error, undefined);
+  assert.equal(transaction.integrity, '9c2bd6c5639daea0');
+});
+
 test('recording prepare validates the complete log and returns its active tail', () => {
   const first = transaction(0, ZERO_INTEGRITY);
   const second = transaction(1, first.integrity, {

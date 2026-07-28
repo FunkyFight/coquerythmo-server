@@ -21,6 +21,34 @@ const KNOWN_OPERATIONS = new Set([
   'delete_clips',
 ]);
 
+// `NetworkClient::send_raw` serializes a serde_json::Value. With the default
+// serde_json map implementation that second serialization orders object keys
+// lexicographically, while the FNV chain was computed from the original Rust
+// struct order. Rebuild that order from the wire shape before hashing.
+const OPERATION_FIELDS = {
+  batch: ['op', 'operations'],
+  add_asset: ['op', 'asset'],
+  remove_asset: ['op', 'asset_id'],
+  add_track: ['op', 'track'],
+  remove_track: ['op', 'track_id'],
+  rename_track: ['op', 'track_id', 'name'],
+  set_track_muted: ['op', 'track_id', 'muted'],
+  set_track_solo: ['op', 'track_id', 'solo'],
+  arm_track: ['op', 'track_id'],
+  add_clip: ['op', 'clip'],
+  move_clips: ['op', 'placements'],
+  split_clip: ['op', 'clip_id', 'at_frame', 'right_clip_id'],
+  delete_clips: ['op', 'clip_ids'],
+};
+
+const STRUCT_FIELDS = [
+  ['id', 'name', 'muted', 'solo', 'armed'],
+  ['id', 'file_name', 'sample_rate', 'channels', 'sample_count', 'checksum', 'waveform'],
+  ['samples_per_peak', 'peaks'],
+  ['id', 'asset_id', 'track_id', 'start_frame', 'source_start_frame', 'duration_frames'],
+  ['clip_id', 'track_id', 'start_frame'],
+];
+
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -70,7 +98,16 @@ function rustJsonStringify(value, floatValue = false) {
     return `[${value.map(item => rustJsonStringify(item, floatValue)).join(',')}]`;
   }
   if (isObject(value)) {
-    return `{${Object.keys(value)
+    const keys = Object.keys(value);
+    const operationFields = typeof value.op === 'string' ? OPERATION_FIELDS[value.op] : null;
+    const structFields = STRUCT_FIELDS.find(fields =>
+      fields.length === keys.length && fields.every(field => keys.includes(field)));
+    const orderedKeys = operationFields
+      ? [...operationFields, ...keys.filter(key => !operationFields.includes(key))]
+      : structFields
+        ? [...structFields, ...keys.filter(key => !structFields.includes(key))]
+        : keys;
+    return `{${orderedKeys
       .map(key => `${JSON.stringify(key)}:${rustJsonStringify(value[key], key === 'peaks')}`)
       .join(',')}}`;
   }
