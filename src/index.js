@@ -251,6 +251,35 @@ io.on('connection', (socket) => {
     socket.to(room.code).emit('recording_playback', data);
   });
 
+  socket.on('recording_view', (data) => {
+    const room = getRoom(socket);
+    const caller = room?.memberForSocket(socket);
+    if (!room || caller?.role !== 'admin') return;
+    const target = data?._target;
+    if (!Number.isSafeInteger(data?.language_id) || data.language_id < 0
+      || typeof data.instrumental !== 'boolean'
+      || (target !== undefined
+        && (typeof target !== 'string' || !room.memberEntryById(target)))) {
+      return socket.emit('server_error', { message: 'Invalid recording view' });
+    }
+    const payload = {
+      language_id: data.language_id,
+      instrumental: data.instrumental,
+    };
+    if (target !== undefined) {
+      io.to(target).emit('recording_view', payload);
+    } else {
+      socket.to(room.code).emit('recording_view', payload);
+    }
+  });
+
+  socket.on('actor_request', (data) => {
+    const room = getRoom(socket);
+    const caller = room?.memberForSocket(socket);
+    if (!room || caller?.role !== 'admin' || data?.action !== 'open_microphone') return;
+    socket.to(room.code).emit('actor_request', { action: 'open_microphone' });
+  });
+
   socket.on('set_co_director', (data) => {
     const room = getRoom(socket);
     const caller = room?.memberForSocket(socket);
