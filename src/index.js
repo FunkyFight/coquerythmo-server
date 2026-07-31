@@ -271,6 +271,14 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('recording_ready', (data) => {
+    const room = getRoom(socket);
+    if (!room?.setRecordingReady(socket, data?.ready)) {
+      return socket.emit('server_error', { message: 'Invalid recording readiness' });
+    }
+    emitRoomState(room);
+  });
+
   socket.on('actor_request', (data) => {
     const room = getRoom(socket);
     const caller = room?.memberForSocket(socket);
@@ -512,6 +520,7 @@ io.on('connection', (socket) => {
       return socket.emit('server_error', { message: 'Audio transfer ended before completion' });
     }
     relayAudio(room, socket, 'audio_end', data);
+    socket.emit('audio_uploaded', { transfer_id: data.transfer_id });
   });
 
   // --- Chunked video relay ---

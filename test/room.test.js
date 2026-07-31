@@ -100,6 +100,24 @@ test('a refusing participant cannot report a loaded project', () => {
   assert.equal(room.projectTransferResult(actor, 'project_3', true).error, 'project_transfer_recipient_not_accepted');
 });
 
+test('a duplicate terminal project result is idempotent after completion', () => {
+  const admin = fakeSocket('admin');
+  const actor = fakeSocket('actor');
+  const room = createRoom(admin, 'DA', 'same-project');
+  joinRoom(actor, room.code, 'Comédien', undefined);
+  const metadata = {
+    request_id: 'project_4', project_huuid: 'new-project', file_name: 'new.coquerythmo',
+    total_bytes: 1, total_chunks: 1, chunk_size: 192 * 1024, sha1: 'a'.repeat(40),
+  };
+  room.beginProjectTransfer(admin, metadata);
+  room.projectTransferResponse(actor, 'project_4', 'accepted');
+  room.projectTransfer.streamEnded = true;
+  room.projectTransfer.phase = 'finishing';
+  assert.equal(room.projectTransferResult(actor, 'project_4', true).error, undefined);
+  assert.equal(room.projectTransfer.phase, 'completed');
+  assert.equal(room.projectTransferResult(actor, 'project_4', true).error, undefined);
+});
+
 test('matching projects join as actors without timeline control', () => {
   const admin = fakeSocket('admin');
   const actor = fakeSocket('actor');
@@ -127,4 +145,15 @@ test('only a promoted Co-DA can receive recording control', () => {
   assert.equal(room.setCoDirector(actor.id, false), true);
   assert.equal(room.canControl(actor), false);
   assert.equal(room.controlOwnerId, admin.id);
+});
+
+test('actors stay unready until their microphone preflight succeeds', () => {
+  const admin = fakeSocket('admin');
+  const actor = fakeSocket('actor');
+  const room = createRoom(admin, 'DA', 'same-project');
+  joinRoom(actor, room.code, 'Comédien', 'same-project');
+
+  assert.equal(room.memberForSocket(actor).recording_ready, false);
+  assert.equal(room.setRecordingReady(actor, true), true);
+  assert.equal(room.memberForSocket(actor).recording_ready, true);
 });

@@ -30,6 +30,7 @@ class Room {
       username,
       role,
       muted: false,
+      recording_ready: role === 'admin',
     });
     socket.roomCode = this.code;
   }
@@ -123,6 +124,13 @@ class Room {
     const entry = this.memberEntryById(memberId);
     if (!entry || !['admin', 'co_da'].includes(entry[1].role)) return false;
     this.controlOwnerId = memberId;
+    return true;
+  }
+
+  setRecordingReady(socket, ready) {
+    const member = this.memberForSocket(socket);
+    if (!member || typeof ready !== 'boolean') return false;
+    member.recording_ready = ready;
     return true;
   }
 
@@ -286,6 +294,11 @@ class Room {
     if (!transfer || transfer.requestId !== requestId || !participant) {
       return { error: 'unknown_project_transfer' };
     }
+    // Result delivery is retried by clients when the final status races with
+    // the import completion. Treat an already terminal participant as an
+    // idempotent success instead of turning a completed transfer into an
+    // error.
+    if (['loaded', 'failed'].includes(participant.response)) return { transfer };
     if (participant.response !== 'receiving') return { error: 'project_transfer_recipient_not_accepted' };
     if (!['finishing', 'transferring'].includes(transfer.phase)) {
       return { error: 'project_transfer_not_active' };
