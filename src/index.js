@@ -390,6 +390,15 @@ io.on('connection', (socket) => {
     emitProjectTransferStatus(room);
   });
 
+  socket.on('project_transfer_loading', (data) => {
+    const room = getRoom(socket);
+    const result = room?.projectTransferLoading(socket, data?.request_id);
+    if (!result || result.error) {
+      return socket.emit('server_error', { message: result?.error || 'Not in a room' });
+    }
+    emitProjectTransferStatus(room);
+  });
+
   socket.on('project_transfer_result', (data) => {
     const room = getRoom(socket);
     const result = room?.projectTransferResult(

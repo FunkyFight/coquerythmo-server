@@ -287,6 +287,22 @@ class Room {
     return { transfer };
   }
 
+  projectTransferLoading(socket, requestId, now = Date.now()) {
+    const transfer = this.projectTransfer;
+    const member = this.memberForSocket(socket);
+    const participant = member && transfer?.participants[member.id];
+    if (!transfer || transfer.requestId !== requestId || !participant) {
+      return { error: 'unknown_project_transfer' };
+    }
+    if (participant.response !== 'receiving' || transfer.phase !== 'finishing') {
+      return { error: 'project_transfer_recipient_not_accepted' };
+    }
+    participant.response = 'loading';
+    participant.progress = 1;
+    transfer.lastActivity = now;
+    return { transfer };
+  }
+
   projectTransferResult(socket, requestId, success, error) {
     const transfer = this.projectTransfer;
     const member = this.memberForSocket(socket);
@@ -299,7 +315,9 @@ class Room {
     // idempotent success instead of turning a completed transfer into an
     // error.
     if (['loaded', 'failed'].includes(participant.response)) return { transfer };
-    if (participant.response !== 'receiving') return { error: 'project_transfer_recipient_not_accepted' };
+    if (!['receiving', 'loading'].includes(participant.response)) {
+      return { error: 'project_transfer_recipient_not_accepted' };
+    }
     if (!['finishing', 'transferring'].includes(transfer.phase)) {
       return { error: 'project_transfer_not_active' };
     }
@@ -315,7 +333,7 @@ class Room {
     const transfer = this.projectTransfer;
     if (!transfer || !transfer.streamEnded) return false;
     const accepted = Object.values(transfer.participants)
-      .filter(({ response }) => ['receiving', 'loaded', 'failed', 'disconnected'].includes(response));
+      .filter(({ response }) => ['receiving', 'loading', 'loaded', 'failed', 'disconnected'].includes(response));
     if (accepted.length > 0 && accepted.every(({ response }) => ['loaded', 'failed', 'disconnected'].includes(response))) {
       transfer.phase = 'completed';
       return true;

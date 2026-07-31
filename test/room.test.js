@@ -118,6 +118,26 @@ test('a duplicate terminal project result is idempotent after completion', () =>
   assert.equal(room.projectTransferResult(actor, 'project_4', true).error, undefined);
 });
 
+test('project loading is visible and still reaches a terminal state', () => {
+  const admin = fakeSocket('admin');
+  const actor = fakeSocket('actor');
+  const room = createRoom(admin, 'DA', 'same-project');
+  joinRoom(actor, room.code, 'ComÃ©dien', undefined);
+  const metadata = {
+    request_id: 'project_5', project_huuid: 'new-project', file_name: 'new.coquerythmo',
+    total_bytes: 1, total_chunks: 1, chunk_size: 192 * 1024, sha1: 'a'.repeat(40),
+  };
+  room.beginProjectTransfer(admin, metadata);
+  room.projectTransferResponse(actor, 'project_5', 'accepted');
+  room.projectTransfer.streamEnded = true;
+  room.projectTransfer.phase = 'finishing';
+
+  assert.equal(room.projectTransferLoading(actor, 'project_5').error, undefined);
+  assert.equal(room.projectTransferForSocket(actor).response, 'loading');
+  assert.equal(room.projectTransferResult(actor, 'project_5', true).error, undefined);
+  assert.equal(room.projectTransfer.phase, 'completed');
+});
+
 test('matching projects join as actors without timeline control', () => {
   const admin = fakeSocket('admin');
   const actor = fakeSocket('actor');
