@@ -6,6 +6,8 @@ const {
   expiredTransferIds,
   validateAudioChunk,
   validateAudioStart,
+  validateProjectChunk,
+  validateProjectStart,
   validateRecordingLog,
   validateRecordingPrepare,
   validateRecordingTransaction,
@@ -75,6 +77,31 @@ test('audio transfer metadata and canonical chunks are validated', () => {
     validateAudioChunk({ transfer_id: 'take_1', index: 1, data: 'aGk=' }, transfer).error,
     /out of order/,
   );
+});
+
+test('project transfer metadata and chunks use the same strict geometry', () => {
+  const metadata = {
+    request_id: 'project_1',
+    project_huuid: 'Coquerythmo-3.6.0-A',
+    file_name: 'scene.coquerythmo',
+    total_bytes: 2,
+    total_chunks: 1,
+    chunk_size: 192 * 1024,
+    sha1: 'a'.repeat(40),
+  };
+  assert.equal(validateProjectStart(metadata).error, undefined);
+  const transfer = {
+    requestId: metadata.request_id,
+    nextIndex: 0,
+    chunkSize: metadata.chunk_size,
+    receivedBytes: 0,
+    totalBytes: metadata.total_bytes,
+  };
+  assert.equal(validateProjectChunk({ request_id: 'project_1', index: 0, data: 'aGk=' }, transfer).bytes, 2);
+  assert.match(validateProjectChunk({ request_id: 'project_1', index: 1, data: 'aGk=' }, transfer).error, /out of order/);
+  assert.match(validateProjectChunk({ request_id: 'project_1', index: 0, data: 'aGk' }, transfer).error, /base64/);
+  assert.match(validateProjectStart({ ...metadata, file_name: '../scene.coquerythmo' }).error, /file name/);
+  assert.match(validateProjectStart({ ...metadata, total_chunks: 2 }).error, /geometry/);
 });
 
 test('inactive audio transfers expire while active ones remain', () => {

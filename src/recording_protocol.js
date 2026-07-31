@@ -1,5 +1,7 @@
 const AUDIO_CHUNK_MAX_BYTES = 256 * 1024;
 const AUDIO_MAX_BYTES = 4 * 1024 * 1024 * 1024;
+const PROJECT_CHUNK_MAX_BYTES = 192 * 1024;
+const PROJECT_MAX_BYTES = 64 * 1024 * 1024 * 1024;
 const MAX_RECORDING_TRANSACTION_BYTES = 4 * 1024 * 1024;
 const MAX_RECORDING_ENTRIES = 10000;
 const MAX_BATCH_OPERATIONS = 1024;
@@ -230,6 +232,60 @@ function validateAudioStart(data) {
   return { bytes: data.total_bytes };
 }
 
+function validateProjectStart(data) {
+  if (!isObject(data)) return { error: 'project_transfer payload is invalid' };
+  if (typeof data.request_id !== 'string' || !/^[A-Za-z0-9_-]{1,96}$/.test(data.request_id)) {
+    return { error: 'project transfer id is invalid' };
+  }
+  if (typeof data.file_name !== 'string' || data.file_name.length > 256
+    || data.file_name.trim() !== data.file_name || data.file_name.length === 0
+    || data.file_name === '.' || data.file_name === '..'
+    || data.file_name.includes('/') || data.file_name.includes('\\')
+    || data.file_name.includes(':') || [...data.file_name].some(char => /\p{Cc}/u.test(char))
+    || !data.file_name.toLowerCase().endsWith('.coquerythmo')) {
+    return { error: 'project file name is invalid' };
+  }
+  if (typeof data.project_huuid !== 'string' || data.project_huuid.length === 0
+    || data.project_huuid.length > 256 || [...data.project_huuid].some(char => /\p{Cc}/u.test(char))) {
+    return { error: 'project HUUID is invalid' };
+  }
+  if (!Number.isSafeInteger(data.total_bytes) || data.total_bytes <= 0
+    || data.total_bytes > PROJECT_MAX_BYTES) {
+    return { error: 'project transfer size is invalid' };
+  }
+  if (!Number.isSafeInteger(data.total_chunks) || data.total_chunks <= 0
+    || !Number.isSafeInteger(data.chunk_size) || data.chunk_size <= 0
+    || data.chunk_size > PROJECT_CHUNK_MAX_BYTES
+    || data.total_chunks !== Math.ceil(data.total_bytes / data.chunk_size)) {
+    return { error: 'project transfer chunk geometry is invalid' };
+  }
+  if (typeof data.sha1 !== 'string' || !/^[a-f0-9]{40}$/.test(data.sha1)) {
+    return { error: 'project transfer SHA-1 is invalid' };
+  }
+  return { bytes: data.total_bytes };
+}
+
+function validateProjectChunk(data, transfer) {
+  if (!isObject(data) || typeof data.request_id !== 'string'
+    || !/^[A-Za-z0-9_-]{1,96}$/.test(data.request_id)
+    || !Number.isSafeInteger(data.index) || data.index < 0) {
+    return { error: 'project chunk header is invalid' };
+  }
+  if (!transfer) return { error: 'unknown project transfer' };
+  if (data.request_id !== transfer.requestId) return { error: 'project transfer id mismatch' };
+  if (data.index !== transfer.nextIndex) {
+    return { error: `project chunk out of order: expected ${transfer.nextIndex}` };
+  }
+  const decoded = decodeCanonicalBase64(data.data);
+  if (!decoded || decoded.length === 0 || decoded.length > transfer.chunkSize) {
+    return { error: 'project chunk base64 or size is invalid' };
+  }
+  if (transfer.receivedBytes + decoded.length > transfer.totalBytes) {
+    return { error: 'project transfer exceeds announced size' };
+  }
+  return { bytes: decoded.length };
+}
+
 function decodeCanonicalBase64(data) {
   if (typeof data !== 'string' || data.length === 0 || data.length % 4 !== 0
     || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
@@ -272,6 +328,8 @@ function relayAudio(room, sender, event, data) {
 module.exports = {
   AUDIO_CHUNK_MAX_BYTES,
   AUDIO_MAX_BYTES,
+  PROJECT_CHUNK_MAX_BYTES,
+  PROJECT_MAX_BYTES,
   MAX_RECORDING_TRANSACTION_BYTES,
   ZERO_INTEGRITY,
   decodeCanonicalBase64,
@@ -279,6 +337,8 @@ module.exports = {
   relayAudio,
   validateAudioChunk,
   validateAudioStart,
+  validateProjectChunk,
+  validateProjectStart,
   validateRecordingLog,
   validateRecordingPrepare,
   validateRecordingTransaction,
