@@ -65,6 +65,80 @@ test('project transfer targets the current non-directors and waits for every res
   assert.equal(room.projectHuuid, 'new-project');
 });
 
+test('a participant reconnecting during a project transfer restarts it instead of completing it', () => {
+  const admin = fakeSocket('admin');
+  const actor = fakeSocket('actor');
+  const reconnected = fakeSocket('actor-reconnected');
+  const room = createRoom(admin, 'DA', 'same-project');
+  joinRoom(actor, room.code, 'Comédien', undefined, 'actor-session');
+  const metadata = {
+    request_id: 'project_reconnect', project_huuid: 'new-project', file_name: 'new.coquerythmo',
+    total_bytes: 1, total_chunks: 1, chunk_size: 192 * 1024, sha1: 'a'.repeat(40),
+  };
+
+  room.beginProjectTransfer(admin, metadata, 1000);
+  room.projectTransferResponse(actor, 'project_reconnect', 'accepted');
+  room.startProjectTransferStream(admin, metadata, 1100);
+  room.projectTransferChunk(admin, {
+    request_id: 'project_reconnect',
+    index: 0,
+  }, { bytes: 1 }, 1200);
+  room.removeMember(actor);
+
+  assert.equal(room.projectTransfer.phase, 'transferring');
+  assert.equal(room.projectTransfer.participants.actor.socket, null);
+
+  const result = joinRoom(
+    reconnected,
+    room.code,
+    'Comédien',
+    undefined,
+    'actor-session',
+  );
+
+  assert.equal(result.reconnected.restarted, false);
+  assert.equal(room.projectTransfer.phase, 'transferring');
+  assert.equal(room.projectTransfer.participants['actor-reconnected'].response, 'disconnected');
+
+  const finished = room.finishProjectTransferStream(admin, 'project_reconnect', 1300);
+
+  assert.equal(finished.restarted, true);
+  assert.equal(room.projectTransfer.phase, 'collecting');
+  assert.equal(room.projectTransfer.streamStarted, false);
+  assert.equal(room.projectTransfer.participants['actor-reconnected'].response, 'pending');
+  assert.equal(room.projectTransfer.participants.actor, undefined);
+});
+
+test('a fast reconnect replaces the stale socket before reattaching the participant', () => {
+  const admin = fakeSocket('admin');
+  const actor = fakeSocket('actor');
+  const reconnected = fakeSocket('actor-reconnected');
+  const room = createRoom(admin, 'DA', 'same-project');
+  joinRoom(actor, room.code, 'Comédien', undefined, 'actor-session');
+  const metadata = {
+    request_id: 'project_fast_reconnect', project_huuid: 'new-project',
+    file_name: 'new.coquerythmo', total_bytes: 1, total_chunks: 1,
+    chunk_size: 192 * 1024, sha1: 'a'.repeat(40),
+  };
+
+  room.beginProjectTransfer(admin, metadata);
+  room.projectTransferResponse(actor, 'project_fast_reconnect', 'accepted');
+
+  const result = joinRoom(
+    reconnected,
+    room.code,
+    'Comédien',
+    undefined,
+    'actor-session',
+  );
+
+  assert.equal(result.reconnected.restarted, false);
+  assert.equal(actor.roomCode, null);
+  assert.equal(room.members.size, 2);
+  assert.equal(room.projectTransfer.participants['actor-reconnected'].socket, reconnected);
+  assert.equal(room.projectTransfer.participants.actor, undefined);
+});
+
 test('project transfer expires unanswered participants and sends nothing when all refuse', () => {
   const admin = fakeSocket('admin');
   const actor = fakeSocket('actor');
@@ -84,6 +158,23 @@ test('project transfer expires unanswered participants and sends nothing when al
   const next = fakeSocket('next');
   joinRoom(next, room.code, 'Tardif', undefined);
   assert.equal(room.projectTransfer.participants[next.id], undefined);
+});
+
+test('the director can close the waiting transfer before any stream starts', () => {
+  const admin = fakeSocket('admin');
+  const actor = fakeSocket('actor');
+  const room = createRoom(admin, 'DA', 'same-project');
+  joinRoom(actor, room.code, 'Comédien', undefined);
+  const metadata = {
+    request_id: 'project_close_waiting', project_huuid: 'new-project',
+    file_name: 'new.coquerythmo', total_bytes: 1, total_chunks: 1,
+    chunk_size: 192 * 1024, sha1: 'a'.repeat(40),
+  };
+
+  room.beginProjectTransfer(admin, metadata);
+  assert.equal(room.closeProjectTransferWaiting(), true);
+  assert.equal(room.projectTransfer.phase, 'completed');
+  assert.equal(room.projectTransfer.participants[actor.id].response, 'refused');
 });
 
 test('a refusing participant cannot report a loaded project', () => {

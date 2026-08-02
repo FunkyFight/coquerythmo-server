@@ -100,7 +100,7 @@ io.on('connection', (socket) => {
     const username = data.username.trim().substring(0, 32);
     socket.username = username;
     const projectHuuid = data.project_huuid.trim().substring(0, 256);
-    const room = createRoom(socket, username, projectHuuid);
+    const room = createRoom(socket, username, projectHuuid, sessionIdFrom(data));
     socket.join(room.code);
     socket.emit('room_created', {
       code: room.code,
@@ -120,7 +120,7 @@ io.on('connection', (socket) => {
     socket.username = username;
     const projectHuuid = typeof data.project_huuid === 'string' && data.project_huuid.trim()
       ? data.project_huuid.trim() : null;
-    const result = joinRoom(socket, code, username, projectHuuid);
+    const result = joinRoom(socket, code, username, projectHuuid, sessionIdFrom(data));
     if (result.error === 'room_not_found') {
       return socket.emit('join_error', { reason: 'room_not_found' });
     }
@@ -137,6 +137,18 @@ io.on('connection', (socket) => {
     });
     socket.to(room.code).emit('member_joined', { username });
     emitRoomState(room);
+    if (result.reconnected) {
+      if (result.reconnected.restarted) {
+        emitProjectTransferRequests(room);
+      } else if (room.projectTransfer?.phase === 'collecting') {
+        emitProjectTransferRequest(
+          socket,
+          room.projectTransfer,
+          room.adminEntry()?.[1]?.id,
+        );
+      }
+      emitProjectTransferStatus(room);
+    }
     console.log(`[room] ${username} joined room ${code}`);
   });
 
@@ -285,6 +297,11 @@ io.on('connection', (socket) => {
     if (!room || caller?.role !== 'admin') return;
     if (data?.action === 'open_microphone') {
       socket.to(room.code).emit('actor_request', { action: 'open_microphone' });
+    } else if (data?.action === 'close_project_transfer_waiting') {
+      socket.to(room.code).emit('actor_request', {
+        action: 'close_project_transfer_waiting',
+      });
+      if (room.closeProjectTransferWaiting()) emitProjectTransferStatus(room);
     }
   });
 
@@ -299,10 +316,7 @@ io.on('connection', (socket) => {
     const result = room.beginProjectTransfer(socket, data);
     if (result.error) return socket.emit('server_error', { message: result.error });
     for (const participant of Object.values(result.transfer.participants)) {
-      participant.socket.emit('project_transfer_request', {
-        ...data,
-        from_member_id: room.memberForSocket(socket).id,
-      });
+      emitProjectTransferRequest(participant.socket, result.transfer, room.memberForSocket(socket).id);
     }
     emitProjectTransferStatus(room);
   });
@@ -380,6 +394,11 @@ io.on('connection', (socket) => {
         emitProjectTransferStatus(room);
       }
       return socket.emit('server_error', { message: result?.error || 'Not in a room' });
+    }
+    if (result.restarted) {
+      emitProjectTransferStatus(room);
+      emitProjectTransferRequests(room);
+      return;
     }
     for (const memberId of result.transfer.acceptedIds || []) {
       const participant = result.transfer.participants[memberId];
@@ -606,6 +625,31 @@ function projectTransferStatus(room) {
 function emitProjectTransferStatus(room) {
   const payload = projectTransferStatus(room);
   if (payload) io.to(room.code).emit('project_transfer_status', payload);
+}
+
+function emitProjectTransferRequest(socket, transfer, fromMemberId) {
+  socket.emit('project_transfer_request', {
+    ...transfer.metadata,
+    from_member_id: fromMemberId,
+  });
+}
+
+function emitProjectTransferRequests(room) {
+  const transfer = room.projectTransfer;
+  if (!transfer) return;
+  const fromMemberId = room.adminEntry()?.[1]?.id;
+  for (const participant of Object.values(transfer.participants)) {
+    if (participant.socket && participant.response === 'pending') {
+      emitProjectTransferRequest(participant.socket, transfer, fromMemberId);
+    }
+  }
+}
+
+function sessionIdFrom(data) {
+  return typeof data?.session_id === 'string'
+    && /^[A-Za-z0-9_-]{1,128}$/.test(data.session_id)
+    ? data.session_id
+    : null;
 }
 
 function controlledRecordingRoom(socket) {

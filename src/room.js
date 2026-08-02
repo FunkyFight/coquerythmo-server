@@ -11,7 +11,7 @@ function generateCode() {
 }
 
 class Room {
-  constructor(code, adminSocket, adminUsername, projectHuuid) {
+  constructor(code, adminSocket, adminUsername, projectHuuid, adminSessionId = null) {
     this.code = code;
     this.projectHuuid = projectHuuid;
     this.members = new Map(); // socket -> { id, username, role, muted }
@@ -21,14 +21,15 @@ class Room {
       previousIntegrity: ZERO_INTEGRITY,
     };
     this.projectTransfer = null;
-    this.addMember(adminSocket, adminUsername, 'admin');
+    this.addMember(adminSocket, adminUsername, 'admin', adminSessionId);
   }
 
-  addMember(socket, username, role) {
+  addMember(socket, username, role, sessionId = null) {
     this.members.set(socket, {
       id: socket.id,
       username,
       role,
+      sessionId,
       muted: false,
       recording_ready: role === 'admin',
     });
@@ -46,14 +47,13 @@ class Room {
         this.projectTransfer.cancelReason = 'director_left';
       } else if (member) {
         const participant = this.projectTransfer.participants[member.id];
-        if (participant && ['receiving', 'loaded'].includes(participant.response)
-          && ['transferring', 'finishing'].includes(this.projectTransfer.phase)) {
-          participant.response = 'disconnected';
+        if (participant) {
+          if (['transferring', 'finishing'].includes(this.projectTransfer.phase)
+            && ['receiving', 'loading'].includes(participant.response)) {
+            participant.response = 'disconnected';
+          }
           participant.socket = null;
-          this.completeProjectTransferIfReady();
-        } else {
-          delete this.projectTransfer.participants[member.id];
-          this.evaluateProjectTransfer();
+          participant.disconnectedAt = Date.now();
         }
       }
     }
@@ -83,11 +83,21 @@ class Room {
   }
 
   getMemberList() {
-    return [...this.members.values()].map(member => ({ ...member }));
+    return [...this.members.values()].map(({ sessionId, ...member }) => ({ ...member }));
   }
 
   memberForSocket(socket) {
     return this.members.get(socket) || null;
+  }
+
+  replaceMemberForSession(sessionId) {
+    if (!sessionId) return null;
+    for (const [socket, member] of this.members) {
+      if (member.sessionId === sessionId) {
+        return this.removeMember(socket);
+      }
+    }
+    return null;
   }
 
   memberEntryById(memberId) {
@@ -158,6 +168,7 @@ class Room {
       participants[member.id] = {
         memberId: member.id,
         username: member.username,
+        sessionId: member.sessionId,
         response: 'pending',
         progress: 0,
         socket,
@@ -182,6 +193,68 @@ class Room {
   projectTransferForSocket(socket) {
     const member = this.memberForSocket(socket);
     return member && this.projectTransfer?.participants[member.id];
+  }
+
+  reattachProjectTransfer(socket, username, sessionId, now = Date.now()) {
+    const transfer = this.projectTransfer;
+    if (!transfer || ['completed', 'cancelled'].includes(transfer.phase)) return null;
+
+    const candidate = Object.entries(transfer.participants).find(([, participant]) => {
+      if (participant.socket) return false;
+      const sameSession = sessionId && participant.sessionId === sessionId;
+      const legacyUsernameMatch = (!sessionId || !participant.sessionId)
+        && participant.username === username;
+      return sameSession || legacyUsernameMatch;
+    });
+    if (!candidate) return null;
+
+    const [oldMemberId, participant] = candidate;
+    delete transfer.participants[oldMemberId];
+    participant.memberId = socket.id;
+    participant.socket = socket;
+    participant.sessionId = sessionId || participant.sessionId || null;
+    participant.disconnectedAt = null;
+    transfer.participants[socket.id] = participant;
+    if (transfer.acceptedIds) {
+      transfer.acceptedIds = transfer.acceptedIds.map(memberId => (
+        memberId === oldMemberId ? socket.id : memberId
+      ));
+    }
+
+    if (transfer.phase === 'collecting' && participant.response === 'saving') {
+      participant.response = 'pending';
+      participant.deadline = now + 60_000;
+    }
+
+    const restarted = transfer.phase === 'finishing'
+      && ['accepted', 'receiving', 'loading', 'loaded', 'disconnected']
+        .includes(participant.response)
+      && this.restartProjectTransfer(now);
+    return { participant, restarted };
+  }
+
+  restartProjectTransfer(now = Date.now()) {
+    const transfer = this.projectTransfer;
+    if (!transfer || !['transferring', 'finishing'].includes(transfer.phase)) return false;
+    const retryable = Object.values(transfer.participants)
+      .filter(({ response }) => ['accepted', 'receiving', 'loading', 'loaded', 'disconnected']
+        .includes(response));
+    if (retryable.length === 0) return false;
+
+    for (const participant of retryable) {
+      participant.response = 'pending';
+      participant.progress = 0;
+      participant.deadline = now + 60_000;
+      delete participant.error;
+    }
+    transfer.phase = 'collecting';
+    transfer.streamStarted = false;
+    transfer.streamEnded = false;
+    transfer.nextIndex = 0;
+    transfer.receivedBytes = 0;
+    transfer.lastActivity = now;
+    delete transfer.acceptedIds;
+    return true;
   }
 
   projectTransferResponse(socket, requestId, response, now = Date.now()) {
@@ -233,6 +306,20 @@ class Room {
     return true;
   }
 
+  closeProjectTransferWaiting() {
+    const transfer = this.projectTransfer;
+    if (!transfer || transfer.phase !== 'collecting') return false;
+    let changed = false;
+    for (const participant of Object.values(transfer.participants)) {
+      if (['pending', 'saving', 'accepted'].includes(participant.response)) {
+        participant.response = 'refused';
+        participant.deadline = 0;
+        changed = true;
+      }
+    }
+    return changed && this.evaluateProjectTransfer();
+  }
+
   startProjectTransferStream(socket, data, now = Date.now()) {
     const transfer = this.projectTransfer;
     const caller = this.memberForSocket(socket);
@@ -280,6 +367,10 @@ class Room {
     if (transfer.nextIndex !== transfer.metadata.total_chunks
       || transfer.receivedBytes !== transfer.metadata.total_bytes) {
       return { error: 'project_transfer_ended_before_completion' };
+    }
+    if (Object.values(transfer.participants).some(({ response }) => response === 'disconnected')) {
+      this.restartProjectTransfer(now);
+      return { transfer, restarted: true };
     }
     transfer.streamEnded = true;
     transfer.phase = 'finishing';
@@ -361,20 +452,26 @@ class Room {
 /** Map of code -> Room */
 const rooms = new Map();
 
-function createRoom(socket, username, projectHuuid) {
+function createRoom(socket, username, projectHuuid, sessionId = null) {
   let code;
   do { code = generateCode(); } while (rooms.has(code));
 
-  const room = new Room(code, socket, username, projectHuuid);
+  const room = new Room(code, socket, username, projectHuuid, sessionId);
   rooms.set(code, room);
   return room;
 }
 
-function joinRoom(socket, code, username, projectHuuid) {
+function joinRoom(socket, code, username, projectHuuid, sessionId = null) {
   const room = rooms.get(code);
   if (!room) return { error: 'room_not_found' };
-  room.addMember(socket, username, 'actor');
-  return { room, projectMatches: Boolean(projectHuuid && room.projectHuuid === projectHuuid) };
+  room.replaceMemberForSession(sessionId);
+  room.addMember(socket, username, 'actor', sessionId);
+  const reconnected = room.reattachProjectTransfer(socket, username, sessionId);
+  return {
+    room,
+    projectMatches: Boolean(projectHuuid && room.projectHuuid === projectHuuid),
+    reconnected,
+  };
 }
 
 function leaveRoom(socket) {
