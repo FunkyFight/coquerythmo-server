@@ -1,6 +1,7 @@
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 const CODE_LENGTH = 6;
 const ZERO_INTEGRITY = '0000000000000000';
+const RECONNECT_GRACE_MS = 60_000;
 
 function generateCode() {
   let code = '';
@@ -11,11 +12,14 @@ function generateCode() {
 }
 
 class Room {
-  constructor(code, adminSocket, adminUsername, projectHuuid, adminSessionId = null) {
+  constructor(code, adminSocket, adminUsername, projectHuuid, adminSessionId = null, protocolVersion = 1) {
     this.code = code;
     this.projectHuuid = projectHuuid;
-    this.members = new Map(); // socket -> { id, username, role, muted }
-    this.controlOwnerId = adminSocket.id;
+    this.protocolVersion = protocolVersion;
+    this.members = new Map(); // socket -> member; detached members keep their old key
+    this.controlOwnerId = adminSessionId || adminSocket.id;
+    this.activeRecording = null;
+    this.completedAudioTransfers = new Set();
     this.recordingChain = {
       nextSequence: 0,
       previousIntegrity: ZERO_INTEGRITY,
@@ -25,57 +29,152 @@ class Room {
   }
 
   addMember(socket, username, role, sessionId = null) {
-    this.members.set(socket, {
-      id: socket.id,
+    const member = {
+      id: sessionId || socket.id,
       username,
       role,
+      socket,
+      socketId: socket.id,
       sessionId,
       muted: false,
       recording_ready: role === 'admin',
-    });
+      connected: true,
+      reconnect_deadline_ms: null,
+      joinedAt: Date.now(),
+      disconnectedAt: null,
+    };
+    this.members.set(socket, member);
     socket.roomCode = this.code;
+    return member;
   }
 
-  removeMember(socket) {
+  removeMember(socket, { promote = true, immediate = false } = {}) {
+    if (!immediate) return this.detachMember(socket)?.member || null;
     const member = this.members.get(socket);
+    if (!member) return null;
     this.members.delete(socket);
     socket.roomCode = null;
+    member.socket = null;
+    member.connected = false;
+    member.reconnect_deadline_ms = null;
 
-    if (this.projectTransfer) {
-      if (member?.role === 'admin') {
-        this.projectTransfer.phase = 'cancelled';
-        this.projectTransfer.cancelReason = 'director_left';
-      } else if (member) {
-        const participant = this.projectTransfer.participants[member.id];
-        if (participant) {
-          if (['transferring', 'finishing'].includes(this.projectTransfer.phase)
-            && ['receiving', 'loading'].includes(participant.response)) {
-            participant.response = 'disconnected';
-          }
-          participant.socket = null;
-          participant.disconnectedAt = Date.now();
-        }
-      }
+    this.detachProjectTransfer(member);
+    this.cancelRecordingIfMemberLeaves(member);
+
+    if (member.role === 'admin' && promote) {
+      this.promoteOldestConnected();
     }
 
-    // Promote oldest member to admin if the admin left
-    if (member && member.role === 'admin' && this.members.size > 0) {
-      const [firstSocket, firstMember] = this.members.entries().next().value;
-      firstMember.role = 'admin';
-      this.controlOwnerId = firstSocket.id;
-      firstSocket.emit('room_created', {
-        code: this.code,
-        project_huuid: this.projectHuuid,
-        member_id: firstSocket.id,
-      });
-    }
-
-    if (member && member.id === this.controlOwnerId) {
+    if (member.id === this.controlOwnerId) {
       const admin = this.adminEntry();
-      this.controlOwnerId = admin ? admin[0].id : null;
+      this.controlOwnerId = admin ? admin[1].id : null;
     }
 
     return member;
+  }
+
+  detachMember(socket, now = Date.now()) {
+    const member = this.members.get(socket);
+    if (!member || !member.connected) return null;
+    member.connected = false;
+    member.socket = null;
+    member.socketId = socket.id;
+    member.disconnectedAt = now;
+    member.reconnect_deadline_ms = now + RECONNECT_GRACE_MS;
+    socket.roomCode = null;
+    this.detachProjectTransfer(member, now);
+    const recordingCancelled = this.cancelRecordingIfMemberLeaves(member);
+    return { member, recordingCancelled };
+  }
+
+  reattachMember(socket, username, sessionId) {
+    if (!sessionId) return null;
+    for (const [oldSocket, member] of this.members) {
+      if (member.sessionId !== sessionId) continue;
+      this.members.delete(oldSocket);
+      if (oldSocket !== socket) oldSocket.roomCode = null;
+      this.members.set(socket, member);
+      member.socket = socket;
+      member.socketId = socket.id;
+      member.connected = true;
+      member.reconnect_deadline_ms = null;
+      member.disconnectedAt = null;
+      socket.roomCode = this.code;
+      // The session identity owns the role and mute/readiness state. The
+      // username in a reconnect packet is only a fallback for legacy clients.
+      if (!member.username && username) member.username = username;
+      const transfer = this.reattachProjectTransfer(socket, username, sessionId);
+      return { member, transfer };
+    }
+    return null;
+  }
+
+  expireDetachedMembers(now = Date.now()) {
+    const expired = [...this.members.entries()]
+      .filter(([, member]) => !member.connected
+        && member.reconnect_deadline_ms !== null
+        && member.reconnect_deadline_ms <= now);
+    if (expired.length === 0) return false;
+    let adminExpired = false;
+    for (const [socket, member] of expired) {
+      adminExpired ||= member.role === 'admin';
+      this.members.delete(socket);
+      this.detachProjectTransfer(member, now);
+    }
+    if (adminExpired && !this.adminEntry()) this.promoteOldestConnected();
+    return true;
+  }
+
+  promoteOldestConnected() {
+    const candidates = [...this.members.values()]
+      .filter(member => member.connected && member.socket)
+      .sort((a, b) => a.joinedAt - b.joinedAt);
+    const candidate = candidates.find(member => member.role === 'co_da')
+      || candidates.find(member => member.role !== 'admin');
+    if (!candidate) {
+      this.controlOwnerId = null;
+      return null;
+    }
+    candidate.role = 'admin';
+    candidate.recording_ready = true;
+    this.controlOwnerId = candidate.id;
+    candidate.socket.emit('room_created', {
+      code: this.code,
+      project_huuid: this.projectHuuid,
+      member_id: candidate.id,
+      resumed: false,
+      protocol_version: this.protocolVersion,
+    });
+    return candidate;
+  }
+
+  detachProjectTransfer(member, now = Date.now()) {
+    if (!this.projectTransfer || !member) return;
+    if (member.role === 'admin') {
+      this.projectTransfer.phase = 'cancelled';
+      this.projectTransfer.cancelReason = 'director_left';
+      return;
+    }
+    const participant = Object.values(this.projectTransfer.participants)
+      .find(candidate => candidate.memberId === member.id);
+    if (participant) {
+      if (['transferring', 'finishing'].includes(this.projectTransfer.phase)
+        && ['receiving', 'loading'].includes(participant.response)) {
+        participant.response = 'disconnected';
+      }
+      participant.socket = null;
+      participant.disconnectedAt = now;
+    }
+  }
+
+  cancelRecordingIfMemberLeaves(member) {
+    if (!this.activeRecording || !member) return null;
+    const { phase, requiredIds } = this.activeRecording;
+    if (!['preparing', 'started'].includes(phase)
+      || (member.role !== 'admin' && !requiredIds.has(member.id))) return null;
+    this.activeRecording.phase = 'cancelled';
+    this.activeRecording.cancelReason = 'participant_disconnected';
+    return this.activeRecording;
   }
 
   getMemberUsernames() {
@@ -83,7 +182,15 @@ class Room {
   }
 
   getMemberList() {
-    return [...this.members.values()].map(({ sessionId, ...member }) => ({ ...member }));
+    return [...this.members.values()].map(member => ({
+      id: member.id,
+      username: member.username,
+      role: member.role,
+      muted: member.muted,
+      recording_ready: member.recording_ready,
+      connected: member.connected,
+      reconnect_deadline_ms: member.reconnect_deadline_ms,
+    }));
   }
 
   memberForSocket(socket) {
@@ -94,7 +201,7 @@ class Room {
     if (!sessionId) return null;
     for (const [socket, member] of this.members) {
       if (member.sessionId === sessionId) {
-        return this.removeMember(socket);
+        return this.reattachMember(socket, member.username, sessionId)?.member || null;
       }
     }
     return null;
@@ -102,38 +209,42 @@ class Room {
 
   memberEntryById(memberId) {
     for (const [socket, member] of this.members) {
-      if (member.id === memberId) return [socket, member];
+      if (member.id === memberId || socket.id === memberId || member.socketId === memberId) {
+        return [member.socket || socket, member];
+      }
     }
     return null;
   }
 
   adminEntry() {
     for (const [socket, member] of this.members) {
-      if (member.role === 'admin') return [socket, member];
+      if (member.role === 'admin' && member.connected && member.socket) {
+        return [member.socket, member];
+      }
     }
     return null;
   }
 
   canControl(socket) {
     const member = this.memberForSocket(socket);
-    return Boolean(member && (member.role === 'admin' || member.id === this.controlOwnerId));
+    return Boolean(member?.connected && (member.role === 'admin' || member.id === this.controlOwnerId));
   }
 
   setCoDirector(memberId, enabled) {
     const entry = this.memberEntryById(memberId);
     if (!entry || entry[1].role === 'admin') return false;
     entry[1].role = enabled ? 'co_da' : 'actor';
-    if (!enabled && this.controlOwnerId === memberId) {
+    if (!enabled && this.controlOwnerId === entry[1].id) {
       const admin = this.adminEntry();
-      this.controlOwnerId = admin ? admin[0].id : null;
+      this.controlOwnerId = admin ? admin[1].id : null;
     }
     return true;
   }
 
   setControlOwner(memberId) {
     const entry = this.memberEntryById(memberId);
-    if (!entry || !['admin', 'co_da'].includes(entry[1].role)) return false;
-    this.controlOwnerId = memberId;
+    if (!entry || !entry[1].connected || !['admin', 'co_da'].includes(entry[1].role)) return false;
+    this.controlOwnerId = entry[1].id;
     return true;
   }
 
@@ -156,6 +267,101 @@ class Room {
     return this.members.size === 0;
   }
 
+  connectedMemberIds() {
+    return [...this.members.values()]
+      .filter(member => member.connected)
+      .map(member => member.id);
+  }
+
+  beginRecording(socket, payload, now = Date.now()) {
+    if (!this.canControl(socket)) return { error: 'recording_control_required' };
+    const takeId = payload?.take_id;
+    if (typeof takeId !== 'string' || !/^[A-Za-z0-9_-]{1,96}$/.test(takeId)) {
+      return { error: 'recording_take_id_invalid' };
+    }
+    if (this.activeRecording && this.activeRecording.takeId === takeId) {
+      return { recording: this.activeRecording, repeated: true };
+    }
+    if (this.activeRecording && ['preparing', 'started'].includes(this.activeRecording.phase)) {
+      return { error: 'recording_already_active' };
+    }
+    const requiredIds = new Set([...this.members.values()]
+      .filter(member => member.connected && member.role === 'actor' && !member.muted)
+      .map(member => member.id));
+    this.activeRecording = {
+      takeId,
+      payload: { ...payload },
+      phase: 'preparing',
+      requiredIds,
+      prepared: new Map(),
+      deadline: now + 10_000,
+      startAt: null,
+      cancelReason: null,
+    };
+    if (requiredIds.size === 0) this.startRecording(now);
+    return { recording: this.activeRecording };
+  }
+
+  prepareRecording(socket, takeId, ready, error, now = Date.now()) {
+    const recording = this.activeRecording;
+    const member = this.memberForSocket(socket);
+    if (!recording || recording.takeId !== takeId || !member) {
+      return { error: 'recording_take_unknown' };
+    }
+    if (recording.phase === 'started') return { recording, repeated: true };
+    if (recording.phase !== 'preparing' || !recording.requiredIds.has(member.id)) {
+      return { recording, repeated: true };
+    }
+    recording.prepared.set(member.id, { ready: ready === true, error: error || null });
+    if (ready !== true) {
+      recording.phase = 'cancelled';
+      recording.cancelReason = error || 'participant_not_ready';
+      return { recording, cancelled: true };
+    }
+    if ([...recording.requiredIds].every(id => recording.prepared.get(id)?.ready === true)) {
+      this.startRecording(now);
+      return { recording, started: true };
+    }
+    return { recording };
+  }
+
+  startRecording(now = Date.now()) {
+    if (!this.activeRecording || this.activeRecording.phase !== 'preparing') return false;
+    this.activeRecording.phase = 'started';
+    this.activeRecording.startAt = now + 3_000;
+    return true;
+  }
+
+  stopRecording(socket, takeId) {
+    const recording = this.activeRecording;
+    if (!this.canControl(socket)) return { error: 'recording_control_required' };
+    if (!recording || recording.takeId !== takeId) return { error: 'recording_take_unknown' };
+    if (recording.phase === 'preparing') {
+      recording.phase = 'cancelled';
+      recording.cancelReason = 'stopped_during_preparation';
+    } else if (recording.phase === 'started') {
+      recording.phase = 'stopped';
+    }
+    return { recording };
+  }
+
+  cancelRecording(socket, takeId, reason = 'cancelled') {
+    const recording = this.activeRecording;
+    if (socket && !this.canControl(socket)) return { error: 'recording_control_required' };
+    if (!recording || recording.takeId !== takeId) return { error: 'recording_take_unknown' };
+    recording.phase = 'cancelled';
+    recording.cancelReason = reason;
+    return { recording };
+  }
+
+  expireRecordingPreparation(now = Date.now()) {
+    const recording = this.activeRecording;
+    if (!recording || recording.phase !== 'preparing' || recording.deadline > now) return null;
+    recording.phase = 'cancelled';
+    recording.cancelReason = 'preparation_timeout';
+    return recording;
+  }
+
   beginProjectTransfer(adminSocket, metadata, now = Date.now()) {
     const caller = this.memberForSocket(adminSocket);
     if (!caller || caller.role !== 'admin') return { error: 'director_required' };
@@ -164,14 +370,14 @@ class Room {
     }
     const participants = {};
     for (const [socket, member] of this.members) {
-      if (socket === adminSocket) continue;
-      participants[member.id] = {
+      if (member.id === this.memberForSocket(adminSocket)?.id) continue;
+      participants[socket.id] = {
         memberId: member.id,
         username: member.username,
         sessionId: member.sessionId,
         response: 'pending',
         progress: 0,
-        socket,
+        socket: member.socket,
         deadline: now + 60_000,
       };
     }
@@ -192,7 +398,9 @@ class Room {
 
   projectTransferForSocket(socket) {
     const member = this.memberForSocket(socket);
-    return member && this.projectTransfer?.participants[member.id];
+    if (!member || !this.projectTransfer) return null;
+    return Object.values(this.projectTransfer.participants)
+      .find(participant => participant.memberId === member.id);
   }
 
   reattachProjectTransfer(socket, username, sessionId, now = Date.now()) {
@@ -200,7 +408,6 @@ class Room {
     if (!transfer || ['completed', 'cancelled'].includes(transfer.phase)) return null;
 
     const candidate = Object.entries(transfer.participants).find(([, participant]) => {
-      if (participant.socket) return false;
       const sameSession = sessionId && participant.sessionId === sessionId;
       const legacyUsernameMatch = (!sessionId || !participant.sessionId)
         && participant.username === username;
@@ -210,7 +417,6 @@ class Room {
 
     const [oldMemberId, participant] = candidate;
     delete transfer.participants[oldMemberId];
-    participant.memberId = socket.id;
     participant.socket = socket;
     participant.sessionId = sessionId || participant.sessionId || null;
     participant.disconnectedAt = null;
@@ -259,8 +465,7 @@ class Room {
 
   projectTransferResponse(socket, requestId, response, now = Date.now()) {
     const transfer = this.projectTransfer;
-    const member = this.memberForSocket(socket);
-    const participant = member && transfer?.participants[member.id];
+    const participant = this.projectTransferForSocket(socket);
     if (!transfer || transfer.requestId !== requestId || !participant) {
       return { error: 'unknown_project_transfer' };
     }
@@ -380,8 +585,7 @@ class Room {
 
   projectTransferLoading(socket, requestId, now = Date.now()) {
     const transfer = this.projectTransfer;
-    const member = this.memberForSocket(socket);
-    const participant = member && transfer?.participants[member.id];
+    const participant = this.projectTransferForSocket(socket);
     if (!transfer || transfer.requestId !== requestId || !participant) {
       return { error: 'unknown_project_transfer' };
     }
@@ -396,8 +600,7 @@ class Room {
 
   projectTransferResult(socket, requestId, success, error) {
     const transfer = this.projectTransfer;
-    const member = this.memberForSocket(socket);
-    const participant = member && transfer?.participants[member.id];
+    const participant = this.projectTransferForSocket(socket);
     if (!transfer || transfer.requestId !== requestId || !participant) {
       return { error: 'unknown_project_transfer' };
     }
@@ -452,25 +655,55 @@ class Room {
 /** Map of code -> Room */
 const rooms = new Map();
 
-function createRoom(socket, username, projectHuuid, sessionId = null) {
+function createRoom(socket, username, projectHuuid, sessionId = null, protocolVersion = 1) {
   let code;
   do { code = generateCode(); } while (rooms.has(code));
 
-  const room = new Room(code, socket, username, projectHuuid, sessionId);
+  const room = new Room(code, socket, username, projectHuuid, sessionId, protocolVersion);
   rooms.set(code, room);
   return room;
 }
 
-function joinRoom(socket, code, username, projectHuuid, sessionId = null) {
-  const room = rooms.get(code);
-  if (!room) return { error: 'room_not_found' };
-  room.replaceMemberForSession(sessionId);
-  room.addMember(socket, username, 'actor', sessionId);
-  const reconnected = room.reattachProjectTransfer(socket, username, sessionId);
+function roomForSession(sessionId) {
+  if (!sessionId) return null;
+  for (const room of rooms.values()) {
+    for (const member of room.members.values()) {
+      if (member.sessionId === sessionId) return room;
+    }
+  }
+  return null;
+}
+
+function resumeRoom(socket, username, projectHuuid, sessionId, protocolVersion = 1) {
+  const room = roomForSession(sessionId);
+  if (!room || room.protocolVersion !== protocolVersion) return null;
+  const reattached = room.reattachMember(socket, username, sessionId);
+  if (!reattached) return null;
+  const { member } = reattached;
   return {
     room,
+    member,
     projectMatches: Boolean(projectHuuid && room.projectHuuid === projectHuuid),
-    reconnected,
+    reconnected: true,
+    transfer: reattached.transfer,
+  };
+}
+
+function joinRoom(socket, code, username, projectHuuid, sessionId = null, protocolVersion = 1) {
+  const room = rooms.get(code);
+  if (!room) return { error: 'room_not_found' };
+  if (room.protocolVersion !== protocolVersion) return { error: 'protocol_version_mismatch' };
+  const reattached = room.reattachMember(socket, username, sessionId);
+  const member = reattached?.member;
+  const reconnected = Boolean(reattached);
+  if (!member) room.addMember(socket, username, 'actor', sessionId);
+  return {
+    room,
+    member: member || room.memberForSocket(socket),
+    projectMatches: Boolean(projectHuuid && room.projectHuuid === projectHuuid),
+    reconnected: reconnected
+      ? { restarted: Boolean(reattached.transfer?.restarted), transfer: reattached.transfer }
+      : null,
   };
 }
 
@@ -480,7 +713,7 @@ function leaveRoom(socket) {
   const room = rooms.get(code);
   if (!room) return null;
 
-  const member = room.removeMember(socket);
+  const member = room.removeMember(socket, { immediate: true });
   if (room.isEmpty()) {
     rooms.delete(code);
   }
@@ -492,4 +725,14 @@ function getRoom(socket) {
   return code ? rooms.get(code) : null;
 }
 
-module.exports = { Room, createRoom, joinRoom, leaveRoom, getRoom, rooms };
+module.exports = {
+  RECONNECT_GRACE_MS,
+  Room,
+  createRoom,
+  joinRoom,
+  leaveRoom,
+  getRoom,
+  roomForSession,
+  resumeRoom,
+  rooms,
+};

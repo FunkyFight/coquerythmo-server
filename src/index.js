@@ -2,7 +2,15 @@ require('dotenv').config();
 
 const { Server } = require('socket.io');
 const { validatePassword } = require('./auth');
-const { createRoom, joinRoom, leaveRoom, getRoom, rooms } = require('./room');
+const {
+  createRoom,
+  joinRoom,
+  leaveRoom,
+  getRoom,
+  roomForSession,
+  resumeRoom,
+  rooms,
+} = require('./room');
 const {
   validateAudioChunk,
   validateAudioStart,
@@ -19,7 +27,6 @@ const PORT = parseInt(process.env.PORT || '9050', 10);
 const SERVER_NAME = process.env.SERVER_NAME || 'Coquerythmo Server';
 const MAX_SLOTS = parseInt(process.env.MAX_SLOTS || '20', 10);
 const MOTD = process.env.MOTD || '';
-const INACTIVITY_TIMEOUT = 15 * 60 * 1000; // 15 minutes
 const AUDIO_TRANSFER_TIMEOUT = 5 * 60 * 1000;
 const MAX_ACTIVE_AUDIO_TRANSFERS = 1;
 const bannedIps = new Set();
@@ -38,6 +45,13 @@ io.use((socket, next) => {
   }
   const password = socket.handshake.auth?.password ?? '';
   if (validatePassword(password)) {
+    const protocolVersion = Number(socket.handshake.auth?.protocol_version ?? 1);
+    if (![1, 2].includes(protocolVersion)) {
+      next(new Error('protocol_version_unsupported'));
+      return;
+    }
+    socket.protocolVersion = protocolVersion;
+    socket.sessionId = sessionIdFrom(socket.handshake.auth);
     next();
   } else {
     console.log('[auth] Client rejected:', socket.id);
@@ -50,18 +64,12 @@ io.on('connection', (socket) => {
   socket.username = null;
   socket.roomCode = null;
   socket.audioTransfers = new Map();
-  socket.lastActivity = Date.now();
 
   if (process.env.DEBUG) {
     socket.onAny((event, ...args) => {
       console.log(`[event] ${socket.id} -> ${event}`, JSON.stringify(args).substring(0, 200));
     });
   }
-
-  // Reset inactivity timer on any incoming event
-  socket.onAny(() => {
-    socket.lastActivity = Date.now();
-  });
 
   // --- Server info (ping) ---
   socket.on('ping_server', () => {
@@ -93,20 +101,51 @@ io.on('connection', (socket) => {
       return socket.emit('server_error', { message: 'A saved project HUUID is required' });
     }
 
-    // Check slot limit
-    let total = 0;
-    for (const [, room] of rooms) total += room.members.size;
-    if (total >= MAX_SLOTS) return socket.emit('server_error', { message: 'Server is full' });
-
     const username = data.username.trim().substring(0, 32);
     socket.username = username;
     const projectHuuid = data.project_huuid.trim().substring(0, 256);
-    const room = createRoom(socket, username, projectHuuid, sessionIdFrom(data));
+    const sessionId = sessionIdFrom(data) || socket.sessionId;
+    const existingRoom = roomForSession(sessionId);
+    if (existingRoom && existingRoom.protocolVersion !== socket.protocolVersion) {
+      return socket.emit('server_error', { message: 'protocol_version_mismatch' });
+    }
+    // A detached member already owns a slot. Reconnection must not be
+    // rejected merely because the room is currently full.
+    if (!existingRoom) {
+      let total = 0;
+      for (const [, room] of rooms) total += room.members.size;
+      if (total >= MAX_SLOTS) return socket.emit('server_error', { message: 'Server is full' });
+    }
+    const resumed = resumeRoom(socket, username, projectHuuid, sessionId, socket.protocolVersion);
+    if (resumed) {
+      const { room, member } = resumed;
+      socket.join(room.code);
+      socket.emit('room_created', {
+        code: room.code,
+        project_huuid: room.projectHuuid,
+        member_id: member.id,
+        resumed: true,
+        protocol_version: room.protocolVersion,
+      });
+      emitRoomState(room);
+      emitResumedTransfers(socket, room);
+      console.log(`[room] ${username} resumed room ${room.code}`);
+      return;
+    }
+    const room = createRoom(
+      socket,
+      username,
+      projectHuuid,
+      sessionId,
+      socket.protocolVersion,
+    );
     socket.join(room.code);
     socket.emit('room_created', {
       code: room.code,
       project_huuid: room.projectHuuid,
-      member_id: socket.id,
+      member_id: room.memberForSocket(socket).id,
+      resumed: false,
+      protocol_version: room.protocolVersion,
     });
     emitRoomState(room);
     console.log(`[room] ${username} created room ${room.code}`);
@@ -121,20 +160,32 @@ io.on('connection', (socket) => {
     socket.username = username;
     const projectHuuid = typeof data.project_huuid === 'string' && data.project_huuid.trim()
       ? data.project_huuid.trim() : null;
-    const result = joinRoom(socket, code, username, projectHuuid, sessionIdFrom(data));
+    const result = joinRoom(
+      socket,
+      code,
+      username,
+      projectHuuid,
+      sessionIdFrom(data) || socket.sessionId,
+      socket.protocolVersion,
+    );
     if (result.error === 'room_not_found') {
       return socket.emit('join_error', { reason: 'room_not_found' });
+    }
+    if (result.error === 'protocol_version_mismatch') {
+      return socket.emit('join_error', { reason: 'protocol_version_mismatch' });
     }
     const room = result.room;
 
     socket.join(room.code);
     socket.emit('room_joined', {
       code: room.code,
-      role: 'actor',
+      role: result.member.role,
       members: room.getMemberUsernames(),
       project_huuid: room.projectHuuid,
       project_matches: result.projectMatches,
-      member_id: socket.id,
+      member_id: result.member.id,
+      resumed: Boolean(result.reconnected),
+      protocol_version: room.protocolVersion,
     });
     socket.to(room.code).emit('member_joined', { username });
     emitRoomState(room);
@@ -155,7 +206,7 @@ io.on('connection', (socket) => {
 
   // --- Leave room ---
   socket.on('leave_room', () => {
-    handleLeave(socket);
+    handleLeave(socket, { explicit: true });
   });
 
   // --- Command broadcast ---
@@ -239,11 +290,73 @@ io.on('connection', (socket) => {
       });
     }
     room.setRecordingChain(validation.chain);
+    if (typeof payload.take_id === 'string' && payload.take_id.length > 0) {
+      const result = room.beginRecording(socket, payload);
+      if (result.error) {
+        return socket.emit('server_error', {
+          message: `Invalid recording preparation: ${result.error}`,
+        });
+      }
+      io.to(room.code).emit('recording_prepare', {
+        ...payload,
+        required_member_ids: [...result.recording.requiredIds],
+      });
+      if (result.recording.phase === 'started' && !result.repeated) {
+        emitRecordingStart(room);
+      } else if (result.repeated) {
+        emitRecordingState(room);
+      }
+      return;
+    }
     if (target !== undefined) {
       io.to(target).emit('recording_prepare', payload);
     } else {
       socket.to(room.code).emit('recording_prepare', payload);
     }
+  });
+
+  socket.on('recording_prepared', (data) => {
+    const room = getRoom(socket);
+    const takeId = typeof data?.take_id === 'string' ? data.take_id : '';
+    const result = room?.prepareRecording(
+      socket,
+      takeId,
+      data?.ready,
+      typeof data?.error === 'string' ? data.error : null,
+    );
+    if (!result || result.error) {
+      return socket.emit('server_error', {
+        message: result?.error || 'Not in a room',
+      });
+    }
+    if (result.cancelled) {
+      emitRecordingCancel(room, result.recording);
+    } else if (result.started) {
+      emitRecordingStart(room);
+    }
+  });
+
+  socket.on('recording_stop', (data) => {
+    const room = getRoom(socket);
+    const result = room?.stopRecording(socket, data?.take_id);
+    if (!result || result.error) {
+      return socket.emit('server_error', {
+        message: result?.error || 'Not in a room',
+      });
+    }
+    if (result.recording.phase === 'cancelled') emitRecordingCancel(room, result.recording);
+    else io.to(room.code).emit('recording_stop', { take_id: result.recording.takeId });
+  });
+
+  socket.on('recording_cancel', (data) => {
+    const room = getRoom(socket);
+    const result = room?.cancelRecording(socket, data?.take_id, data?.reason || 'cancelled');
+    if (!result || result.error) {
+      return socket.emit('server_error', {
+        message: result?.error || 'Not in a room',
+      });
+    }
+    emitRecordingCancel(room, result.recording);
   });
 
   socket.on('recording_capture', (data) => {
@@ -326,7 +439,9 @@ io.on('connection', (socket) => {
     const result = room.beginProjectTransfer(socket, data);
     if (result.error) return socket.emit('server_error', { message: result.error });
     for (const participant of Object.values(result.transfer.participants)) {
-      emitProjectTransferRequest(participant.socket, result.transfer, room.memberForSocket(socket).id);
+      if (participant.socket) {
+        emitProjectTransferRequest(participant.socket, result.transfer, room.memberForSocket(socket).id);
+      }
     }
     emitProjectTransferStatus(room);
   });
@@ -507,6 +622,12 @@ io.on('connection', (socket) => {
     const member = room?.memberForSocket(socket);
     if (!room || !member) return socket.emit('server_error', { message: 'Not in a room' });
     if (member.muted) return socket.emit('server_error', { message: 'Audio input is muted' });
+    if (room.completedAudioTransfers.has(data?.transfer_id)) {
+      return socket.emit('audio_start_ack', {
+        transfer_id: data.transfer_id,
+        status: 'already_complete',
+      });
+    }
     if (socket.audioTransfers.size >= MAX_ACTIVE_AUDIO_TRANSFERS) {
       return socket.emit('server_error', { message: 'Another audio transfer is already active' });
     }
@@ -514,16 +635,61 @@ io.on('connection', (socket) => {
     if (validation.error) {
       return socket.emit('server_error', { message: `Invalid audio transfer: ${validation.error}` });
     }
-    if (socket.audioTransfers.has(data.transfer_id)) return;
+    const targetEntry = typeof data.to_member_id === 'string'
+      ? room.memberEntryById(data.to_member_id)
+      : null;
+    if (data.to_member_id !== undefined
+      && (!targetEntry || !targetEntry[1].connected || !targetEntry[0])) {
+      return socket.emit('server_error', { message: 'Invalid audio recipient' });
+    }
+    const target = targetEntry?.[1].connected ? targetEntry[0] : null;
+    const audioStart = { ...data, from_member_id: member.id };
+    const existingTransfer = socket.audioTransfers.get(data.transfer_id);
+    if (existingTransfer) {
+      const sameTransfer = existingTransfer.fileName === data.file_name
+        && existingTransfer.totalBytes === data.total_bytes
+        && existingTransfer.totalChunks === data.total_chunks
+        && existingTransfer.chunkSize === data.chunk_size
+        && existingTransfer.sha1 === data.sha1
+        && existingTransfer.toMemberId === (typeof data.to_member_id === 'string'
+          ? data.to_member_id : null);
+      if (!sameTransfer) {
+        return socket.emit('server_error', { message: 'Audio transfer id metadata mismatch' });
+      }
+      existingTransfer.nextIndex = 0;
+      existingTransfer.receivedBytes = 0;
+      existingTransfer.lastActivity = Date.now();
+      socket.emit('audio_start_ack', {
+        transfer_id: data.transfer_id,
+        status: 'accepted',
+      });
+      if (typeof data.to_member_id === 'string') {
+        target.emit('audio_start', audioStart);
+      } else {
+        relayAudio(room, socket, 'audio_start', audioStart);
+      }
+      return;
+    }
     socket.audioTransfers.set(data.transfer_id, {
       nextIndex: 0,
       receivedBytes: 0,
       totalBytes: data.total_bytes,
       totalChunks: data.total_chunks,
       chunkSize: data.chunk_size,
+      fileName: data.file_name,
+      sha1: data.sha1,
+      toMemberId: typeof data.to_member_id === 'string' ? data.to_member_id : null,
       lastActivity: Date.now(),
     });
-    relayAudio(room, socket, 'audio_start', { ...data, from_member_id: member.id });
+    socket.emit('audio_start_ack', {
+      transfer_id: data.transfer_id,
+      status: 'accepted',
+    });
+    if (typeof data.to_member_id === 'string') {
+      target.emit('audio_start', audioStart);
+    } else {
+      relayAudio(room, socket, 'audio_start', audioStart);
+    }
   });
 
   socket.on('audio_chunk', (data) => {
@@ -539,7 +705,15 @@ io.on('connection', (socket) => {
     transfer.nextIndex += 1;
     transfer.receivedBytes += validation.bytes;
     transfer.lastActivity = Date.now();
-    relayAudio(room, socket, 'audio_chunk', data);
+    const targetEntry = transfer.toMemberId
+      ? room.memberEntryById(transfer.toMemberId)
+      : null;
+    const target = targetEntry?.[1].connected ? targetEntry[0] : null;
+    if (transfer.toMemberId) {
+      if (target?.id) target.emit('audio_chunk', data);
+    } else {
+      relayAudio(room, socket, 'audio_chunk', data);
+    }
   });
 
   socket.on('audio_end', (data) => {
@@ -557,8 +731,38 @@ io.on('connection', (socket) => {
       || transfer.receivedBytes !== transfer.totalBytes) {
       return socket.emit('server_error', { message: 'Audio transfer ended before completion' });
     }
-    relayAudio(room, socket, 'audio_end', data);
+    const targetEntry = typeof transfer.toMemberId === 'string'
+      ? room.memberEntryById(transfer.toMemberId)
+      : null;
+    const target = targetEntry?.[1].connected ? targetEntry[0] : null;
+    if (transfer.toMemberId) {
+      if (!target?.id) {
+        return socket.emit('server_error', { message: 'Audio recipient disconnected' });
+      }
+      target.emit('audio_end', data);
+    } else {
+      relayAudio(room, socket, 'audio_end', data);
+    }
+    room.completedAudioTransfers.add(data.transfer_id);
     socket.emit('audio_uploaded', { transfer_id: data.transfer_id });
+  });
+
+  socket.on('audio_resync', (data) => {
+    const room = getRoom(socket);
+    const member = room?.memberForSocket(socket);
+    if (!room || !member) return socket.emit('server_error', { message: 'Not in a room' });
+    if (!Array.isArray(data?.checksums) || data.checksums.length > 10_000
+      || data.checksums.some(checksum => typeof checksum !== 'string'
+        || !/^[a-f0-9]{40}$/.test(checksum))) {
+      return socket.emit('server_error', { message: 'Invalid audio resync request' });
+    }
+    const admin = room.adminEntry();
+    if (admin?.[0]) {
+      admin[0].emit('audio_resync_request', {
+        member_id: member.id,
+        checksums: data.checksums,
+      });
+    }
   });
 
   // --- Chunked video relay ---
@@ -586,15 +790,20 @@ io.on('connection', (socket) => {
 
   // --- Disconnect ---
   socket.on('disconnect', () => {
-    handleLeave(socket);
+    handleLeave(socket, { explicit: false });
     console.log('[disconnect] Client:', socket.id);
   });
 });
 
-function handleLeave(socket) {
+function handleLeave(socket, { explicit = false } = {}) {
   socket.audioTransfers?.clear();
-  const result = leaveRoom(socket);
-  if (result && result.member) {
+  if (explicit) {
+    const roomBeforeLeave = getRoom(socket);
+    const memberBeforeLeave = roomBeforeLeave?.memberForSocket(socket);
+    const recordingCancelled = roomBeforeLeave?.cancelRecordingIfMemberLeaves(memberBeforeLeave);
+    const result = leaveRoom(socket);
+    if (!result || !result.member) return;
+    if (recordingCancelled) emitRecordingCancel(result.room, recordingCancelled);
     socket.to(result.room.code).emit('member_left', { username: result.member.username });
     socket.leave(result.room.code);
     console.log(`[room] ${result.member.username} left room`);
@@ -602,6 +811,27 @@ function handleLeave(socket) {
       emitRoomState(result.room);
       if (result.room.projectTransfer) emitProjectTransferStatus(result.room);
     }
+    return;
+  }
+
+  const room = getRoom(socket);
+  if (!room) return;
+  const result = room.detachMember(socket);
+  socket.leave(room.code);
+  if (!result) return;
+  if (result.recordingCancelled) emitRecordingCancel(room, result.recordingCancelled);
+  emitRoomState(room);
+  if (room.projectTransfer) emitProjectTransferStatus(room);
+  console.log(`[room] ${result.member.username} detached for reconnect`);
+  if (room.isEmpty()) rooms.delete(room.code);
+}
+
+function emitResumedTransfers(socket, room) {
+  if (room.projectTransfer) {
+    if (room.projectTransfer.phase === 'collecting') {
+      emitProjectTransferRequest(socket, room.projectTransfer, room.adminEntry()?.[1]?.id);
+    }
+    emitProjectTransferStatus(room);
   }
 }
 
@@ -610,6 +840,31 @@ function emitRoomState(room) {
     members: room.getMemberList(),
     control_owner_id: room.controlOwnerId,
   });
+}
+
+function emitRecordingStart(room) {
+  const recording = room.activeRecording;
+  if (!recording || recording.phase !== 'started') return;
+  io.to(room.code).emit('recording_start', {
+    take_id: recording.takeId,
+    countdown_ms: 3_000,
+    start_at_ms: recording.startAt,
+  });
+}
+
+function emitRecordingCancel(room, recording) {
+  if (!recording) return;
+  io.to(room.code).emit('recording_cancel', {
+    take_id: recording.takeId,
+    reason: recording.cancelReason || 'cancelled',
+  });
+}
+
+function emitRecordingState(room) {
+  const recording = room.activeRecording;
+  if (!recording) return;
+  if (recording.phase === 'started') emitRecordingStart(room);
+  else if (recording.phase === 'cancelled') emitRecordingCancel(room, recording);
 }
 
 function projectTransferStatus(room) {
@@ -695,18 +950,32 @@ function expireAudioTransfers() {
   }
 }
 
-// --- Inactivity check: disconnect clients idle for 15 minutes ---
+function expireRecordingPreparations() {
+  const now = Date.now();
+  for (const [, room] of rooms) {
+    const recording = room.expireRecordingPreparation(now);
+    if (recording) emitRecordingCancel(room, recording);
+  }
+}
+
+function expireDetachedMembers() {
+  const now = Date.now();
+  for (const [, room] of rooms) {
+    const detached = room.expireDetachedMembers(now);
+    if (!detached) continue;
+    if (room.isEmpty()) rooms.delete(room.code);
+    else emitRoomState(room);
+  }
+}
+
+// Socket.IO's heartbeat owns liveness. This timer only expires bounded
+// application state; it never disconnects a healthy-but-idle client.
 setInterval(() => {
   expireAudioTransfers();
-  const now = Date.now();
-  for (const [id, socket] of io.sockets.sockets) {
-    if (now - socket.lastActivity > INACTIVITY_TIMEOUT) {
-      console.log(`[timeout] Disconnecting idle client: ${socket.username || socket.id}`);
-      socket.emit('server_error', { message: 'Disconnected: 15 minutes of inactivity' });
-      handleLeave(socket);
-      socket.disconnect(true);
-    }
-  }
 }, 60 * 1000); // check every minute
+setInterval(() => {
+  expireRecordingPreparations();
+  expireDetachedMembers();
+}, 1000);
 
 console.log(`${SERVER_NAME} listening on port ${PORT} (max ${MAX_SLOTS} slots)`);

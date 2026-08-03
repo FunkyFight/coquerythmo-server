@@ -192,6 +192,10 @@ function validateRecordingPrepare(data) {
   if (!isObject(data) || !isObject(data.project) || !isObject(data.transactions)) {
     return { error: 'recording preparation payload is invalid' };
   }
+  if (data.take_id !== undefined
+    && (typeof data.take_id !== 'string' || !/^[A-Za-z0-9_-]{1,96}$/.test(data.take_id))) {
+    return { error: 'recording take id is invalid' };
+  }
   if (!isSafeNonNegativeInteger(data.current_frame)) {
     return { error: 'recording preparation frame is invalid' };
   }
@@ -241,6 +245,11 @@ function validateAudioStart(data) {
   }
   if (typeof data.sha1 !== 'string' || !/^[a-f0-9]{40}$/.test(data.sha1)) {
     return { error: 'audio transfer SHA-1 is invalid' };
+  }
+  if (data.to_member_id !== undefined
+    && (typeof data.to_member_id !== 'string'
+      || !/^[A-Za-z0-9_-]{1,128}$/.test(data.to_member_id))) {
+    return { error: 'audio recipient id is invalid' };
   }
   return { bytes: data.total_bytes };
 }
