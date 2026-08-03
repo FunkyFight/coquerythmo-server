@@ -8,6 +8,7 @@ const {
   validateAudioStart,
   validateProjectChunk,
   validateProjectStart,
+  validateRecordingDisplaySettings,
   validateRecordingPrepare,
   validateRecordingTransaction,
   expiredTransferIds,
@@ -297,6 +298,15 @@ io.on('connection', (socket) => {
     if (!room || caller?.role !== 'admin') return;
     if (data?.action === 'open_microphone') {
       socket.to(room.code).emit('actor_request', { action: 'open_microphone' });
+    } else if (data?.action === 'apply_display_settings') {
+      const settings = validateRecordingDisplaySettings(data);
+      if (settings.error) {
+        return socket.emit('server_error', { message: settings.error });
+      }
+      socket.to(room.code).emit('actor_request', {
+        action: 'apply_display_settings',
+        ...settings,
+      });
     } else if (data?.action === 'close_project_transfer_waiting') {
       socket.to(room.code).emit('actor_request', {
         action: 'close_project_transfer_waiting',

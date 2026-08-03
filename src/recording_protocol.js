@@ -202,6 +202,19 @@ function validateRecordingPrepare(data) {
   return validateRecordingLog(data.transactions);
 }
 
+function validateRecordingDisplaySettings(data) {
+  if (!isObject(data) || !isFiniteNumber(data.scroll_speed)
+    || data.scroll_speed < 0.25 || data.scroll_speed > 4
+    || !isFiniteNumber(data.reading_bar_offset_percent)
+    || data.reading_bar_offset_percent < -50 || data.reading_bar_offset_percent > 50) {
+    return { error: 'recording display settings are invalid' };
+  }
+  return {
+    scroll_speed: data.scroll_speed,
+    reading_bar_offset_percent: data.reading_bar_offset_percent,
+  };
+}
+
 function validateAudioStart(data) {
   if (!isObject(data)) return { error: 'audio_start payload is invalid' };
   if (typeof data.transfer_id !== 'string' || !/^[A-Za-z0-9_-]{1,96}$/.test(data.transfer_id)) {
@@ -340,6 +353,7 @@ module.exports = {
   validateProjectChunk,
   validateProjectStart,
   validateRecordingLog,
+  validateRecordingDisplaySettings,
   validateRecordingPrepare,
   validateRecordingTransaction,
 };

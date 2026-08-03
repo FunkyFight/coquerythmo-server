@@ -8,6 +8,7 @@ const {
   validateAudioStart,
   validateProjectChunk,
   validateProjectStart,
+  validateRecordingDisplaySettings,
   validateRecordingLog,
   validateRecordingPrepare,
   validateRecordingTransaction,
@@ -151,6 +152,21 @@ test('recording transaction shape and chain ordering are enforced', () => {
       operation: { op: 'not_an_operation' },
     }).error,
     /unknown recording operation/,
+  );
+});
+
+test('recording display settings are bounded', () => {
+  assert.deepEqual(
+    validateRecordingDisplaySettings({ scroll_speed: 1.5, reading_bar_offset_percent: -12 }),
+    { scroll_speed: 1.5, reading_bar_offset_percent: -12 },
+  );
+  assert.match(
+    validateRecordingDisplaySettings({ scroll_speed: 4.1, reading_bar_offset_percent: 0 }).error,
+    /display settings/,
+  );
+  assert.match(
+    validateRecordingDisplaySettings({ scroll_speed: 1, reading_bar_offset_percent: -51 }).error,
+    /display settings/,
   );
 });
 
