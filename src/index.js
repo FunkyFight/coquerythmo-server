@@ -59,8 +59,6 @@ httpServer.on('request', (req, res) => {
     res.end(JSON.stringify(info));
     return;
   }
-  res.writeHead(404);
-  res.end('Not Found');
 });
 
 httpServer.listen(PORT, () => {
