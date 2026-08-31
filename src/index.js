@@ -1,5 +1,6 @@
 require('dotenv').config();
 
+const http = require('http');
 const { Server } = require('socket.io');
 const { validatePassword } = require('./auth');
 const { createRoom, joinRoom, leaveRoom, getRoom, rooms } = require('./room');
@@ -19,14 +20,47 @@ const PORT = parseInt(process.env.PORT || '9050', 10);
 const SERVER_NAME = process.env.SERVER_NAME || 'Coquerythmo Server';
 const MAX_SLOTS = parseInt(process.env.MAX_SLOTS || '20', 10);
 const MOTD = process.env.MOTD || '';
-const INACTIVITY_TIMEOUT = 15 * 60 * 1000; // 15 minutes
-const AUDIO_TRANSFER_TIMEOUT = 5 * 60 * 1000;
+const AUDIO_TRANSFER_TIMEOUT_MINUTES = 30;
+const AUDIO_TRANSFER_TIMEOUT = AUDIO_TRANSFER_TIMEOUT_MINUTES * 60 * 1000;
 const MAX_ACTIVE_AUDIO_TRANSFERS = 1;
 const bannedIps = new Set();
 
-const io = new Server(PORT, {
+const httpServer = http.createServer();
+const io = new Server(httpServer, {
   cors: { origin: '*' },
   maxHttpBufferSize: 200 * 1024 * 1024,
+});
+
+// HTTP /info endpoint for server browser ping (replaces websocket ping_server)
+httpServer.on('request', (req, res) => {
+  if (req.method === 'GET' && req.url?.startsWith('/info')) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const providedPassword = url.searchParams.get('password') || '';
+    if (!validatePassword(providedPassword)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid password' }));
+      return;
+    }
+    let online = 0;
+    for (const [, room] of rooms) {
+      online += room.members.size;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      name: SERVER_NAME,
+      motd: MOTD,
+      max_slots: MAX_SLOTS,
+      online,
+      rooms: rooms.size,
+    }));
+    return;
+  }
+  res.writeHead(404);
+  res.end('Not Found');
+});
+
+httpServer.listen(PORT, () => {
+  console.log(`${SERVER_NAME} listening on port ${PORT} (max ${MAX_SLOTS} slots)`);
 });
 
 // --- Auth via middleware (handshake) ---
@@ -50,40 +84,12 @@ io.on('connection', (socket) => {
   socket.username = null;
   socket.roomCode = null;
   socket.audioTransfers = new Map();
-  socket.lastActivity = Date.now();
 
   if (process.env.DEBUG) {
     socket.onAny((event, ...args) => {
       console.log(`[event] ${socket.id} -> ${event}`, JSON.stringify(args).substring(0, 200));
     });
   }
-
-  // Reset inactivity timer on any incoming event
-  socket.onAny(() => {
-    socket.lastActivity = Date.now();
-  });
-
-  // --- Server info (ping) ---
-  socket.on('ping_server', () => {
-    let online = 0;
-    for (const [, room] of rooms) {
-      online += room.members.size;
-    }
-    socket.emit('server_info', {
-      name: SERVER_NAME,
-      motd: MOTD,
-      max_slots: MAX_SLOTS,
-      online,
-      rooms: rooms.size,
-    }, () => {
-      // Disconnect after ack (if client supports it)
-      socket.disconnect(true);
-    });
-    // Also disconnect after a short delay in case no ack
-    setTimeout(() => {
-      if (socket.connected) socket.disconnect(true);
-    }, 500);
-  });
 
   // --- Create room ---
   socket.on('create_room', (data) => {
@@ -197,10 +203,14 @@ io.on('connection', (socket) => {
     const room = getRoom(socket);
     if (!room) return;
     console.log(`[sync] ${socket.username} sent sync data`);
-    if (data._target) {
-      const target = data._target;
-      delete data._target;
-      io.to(target).emit('sync', data);
+    if (data?._target !== undefined) {
+      const targetSocket = memberSocketInRoom(room, data._target);
+      if (!targetSocket) {
+        return socket.emit('server_error', { message: 'Invalid sync target' });
+      }
+      const payload = { ...data };
+      delete payload._target;
+      targetSocket.emit('sync', payload);
     } else {
       socket.to(room.code).emit('sync', data);
     }
@@ -226,8 +236,8 @@ io.on('connection', (socket) => {
     const room = controlledRecordingRoom(socket);
     if (!room) return;
     const target = data?._target;
-    if (target !== undefined
-      && (typeof target !== 'string' || !room.memberEntryById(target))) {
+    const targetSocket = target === undefined ? null : memberSocketInRoom(room, target);
+    if (target !== undefined && !targetSocket) {
       return socket.emit('server_error', { message: 'Invalid recording preparation target' });
     }
     const payload = { ...data };
@@ -239,8 +249,8 @@ io.on('connection', (socket) => {
       });
     }
     room.setRecordingChain(validation.chain);
-    if (target !== undefined) {
-      io.to(target).emit('recording_prepare', payload);
+    if (targetSocket) {
+      targetSocket.emit('recording_prepare', payload);
     } else {
       socket.to(room.code).emit('recording_prepare', payload);
     }
@@ -267,18 +277,18 @@ io.on('connection', (socket) => {
     const caller = room?.memberForSocket(socket);
     if (!room || caller?.role !== 'admin') return;
     const target = data?._target;
+    const targetSocket = target === undefined ? null : memberSocketInRoom(room, target);
     if (!Number.isSafeInteger(data?.language_id) || data.language_id < 0
       || typeof data.instrumental !== 'boolean'
-      || (target !== undefined
-        && (typeof target !== 'string' || !room.memberEntryById(target)))) {
+      || (target !== undefined && !targetSocket)) {
       return socket.emit('server_error', { message: 'Invalid recording view' });
     }
     const payload = {
       language_id: data.language_id,
       instrumental: data.instrumental,
     };
-    if (target !== undefined) {
-      io.to(target).emit('recording_view', payload);
+    if (targetSocket) {
+      targetSocket.emit('recording_view', payload);
     } else {
       socket.to(room.code).emit('recording_view', payload);
     }
@@ -655,6 +665,11 @@ function emitProjectTransferRequests(room) {
   }
 }
 
+function memberSocketInRoom(room, memberId) {
+  if (typeof memberId !== 'string') return null;
+  return room.memberEntryById(memberId)?.[0] || null;
+}
+
 function sessionIdFrom(data) {
   return typeof data?.session_id === 'string'
     && /^[A-Za-z0-9_-]{1,128}$/.test(data.session_id)
@@ -685,7 +700,7 @@ function expireAudioTransfers() {
     )) {
       socket.audioTransfers.delete(transferId);
       socket.emit('server_error', {
-        message: `Audio transfer ${transferId} expired after 5 minutes of inactivity`,
+        message: `Audio transfer ${transferId} expired after ${AUDIO_TRANSFER_TIMEOUT_MINUTES} minutes of inactivity`,
       });
     }
   }
@@ -695,18 +710,8 @@ function expireAudioTransfers() {
   }
 }
 
-// --- Inactivity check: disconnect clients idle for 15 minutes ---
+// Socket.IO's heartbeat owns liveness. This timer only expires bounded
+// transfer state and never disconnects a healthy client that is only receiving.
 setInterval(() => {
   expireAudioTransfers();
-  const now = Date.now();
-  for (const [id, socket] of io.sockets.sockets) {
-    if (now - socket.lastActivity > INACTIVITY_TIMEOUT) {
-      console.log(`[timeout] Disconnecting idle client: ${socket.username || socket.id}`);
-      socket.emit('server_error', { message: 'Disconnected: 15 minutes of inactivity' });
-      handleLeave(socket);
-      socket.disconnect(true);
-    }
-  }
 }, 60 * 1000); // check every minute
-
-console.log(`${SERVER_NAME} listening on port ${PORT} (max ${MAX_SLOTS} slots)`);
