@@ -229,6 +229,56 @@ test('project loading is visible and still reaches a terminal state', () => {
   assert.equal(room.projectTransfer.phase, 'completed');
 });
 
+test('a slow recipient is not expired after the director finished sending', () => {
+  const admin = fakeSocket('admin');
+  const actor = fakeSocket('actor');
+  const room = createRoom(admin, 'DA', 'same-project');
+  joinRoom(actor, room.code, 'Comédien', undefined);
+  const metadata = {
+    request_id: 'project_slow_recipient', project_huuid: 'new-project',
+    file_name: 'new.coquerythmo', total_bytes: 1, total_chunks: 1,
+    chunk_size: 192 * 1024, sha1: 'a'.repeat(40),
+  };
+
+  room.beginProjectTransfer(admin, metadata, 1_000);
+  room.projectTransferResponse(actor, metadata.request_id, 'accepted');
+  room.startProjectTransferStream(admin, metadata, 2_000);
+  room.projectTransferChunk(admin, {
+    request_id: metadata.request_id,
+    index: 0,
+  }, { bytes: 1 }, 3_000);
+  room.finishProjectTransferStream(admin, metadata.request_id, 4_000);
+
+  assert.equal(room.projectTransfer.phase, 'finishing');
+  assert.equal(room.expireProjectTransfer(604_001), false);
+  assert.equal(room.projectTransfer.phase, 'finishing');
+});
+
+test('project transfers with the same id stay isolated between rooms', () => {
+  const adminA = fakeSocket('admin-a');
+  const actorA = fakeSocket('actor-a');
+  const adminB = fakeSocket('admin-b');
+  const actorB = fakeSocket('actor-b');
+  const roomA = createRoom(adminA, 'DA A', 'project-a');
+  const roomB = createRoom(adminB, 'DA B', 'project-b');
+  joinRoom(actorA, roomA.code, 'Actor A', undefined);
+  joinRoom(actorB, roomB.code, 'Actor B', undefined);
+  const metadata = {
+    request_id: 'same-request-id', project_huuid: 'new-project',
+    file_name: 'new.coquerythmo', total_bytes: 1, total_chunks: 1,
+    chunk_size: 192 * 1024, sha1: 'a'.repeat(40),
+  };
+
+  roomA.beginProjectTransfer(adminA, metadata);
+  roomB.beginProjectTransfer(adminB, metadata);
+  roomA.projectTransferResponse(actorA, metadata.request_id, 'accepted');
+
+  assert.equal(roomA.projectTransfer.phase, 'transferring');
+  assert.equal(roomB.projectTransfer.phase, 'collecting');
+  assert.equal(roomA.projectTransferForSocket(actorB), null);
+  assert.equal(roomB.projectTransferForSocket(actorA), null);
+});
+
 test('matching projects join as actors without timeline control', () => {
   const admin = fakeSocket('admin');
   const actor = fakeSocket('actor');

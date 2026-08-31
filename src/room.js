@@ -637,7 +637,9 @@ class Room {
 
   expireProjectTransfer(now = Date.now()) {
     const transfer = this.projectTransfer;
-    if (!transfer || !['transferring', 'finishing'].includes(transfer.phase)) return false;
+    // Once the director has sent every chunk, a slow recipient may still be
+    // draining its socket. Only the source stream can be inactive here.
+    if (!transfer || transfer.phase !== 'transferring') return false;
     if (now - transfer.lastActivity <= 300_000) return false;
     transfer.phase = 'cancelled';
     transfer.cancelReason = 'inactivity';
