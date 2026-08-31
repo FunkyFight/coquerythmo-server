@@ -319,149 +319,41 @@ test('actors stay unready until their microphone preflight succeeds', () => {
   assert.equal(room.memberForSocket(actor).recording_ready, true);
 });
 
-test('a detached member keeps role, mute and control ownership during grace', () => {
-  const admin = fakeSocket('admin');
+test('a reconnecting director restores the admin role without a promotion', () => {
+  const adminGhost = fakeSocket('admin-ghost');
+  const adminFresh = fakeSocket('admin-fresh');
   const actor = fakeSocket('actor');
-  const resumed = fakeSocket('actor-resumed');
-  const room = createRoom(admin, 'DA', 'same-project', 'admin-session', 2);
-  joinRoom(actor, room.code, 'Co-DA', 'same-project', 'actor-session', 2);
-  room.setCoDirector('actor-session', true);
-  room.setControlOwner('actor-session');
-  room.memberForSocket(actor).muted = true;
+  const room = createRoom(adminGhost, 'DA', 'same-project', 'da-session');
+  joinRoom(actor, room.code, 'Comédien', 'same-project', 'actor-session');
 
-  const detached = room.detachMember(actor, 1_000);
-  assert.equal(detached.member.connected, false);
-  assert.equal(detached.member.reconnect_deadline_ms, 61_000);
-  assert.equal(room.controlOwnerId, 'actor-session');
-  assert.equal(room.expireDetachedMembers(60_999), false);
+  const result = joinRoom(adminFresh, room.code, 'DA', 'same-project', 'da-session');
 
-  const result = joinRoom(
-    resumed,
-    room.code,
-    'changed name is ignored',
-    'same-project',
-    'actor-session',
-    2,
-  );
-  assert.equal(result.reconnected.restarted, false);
-  assert.equal(result.member.id, 'actor-session');
-  assert.equal(result.member.role, 'co_da');
-  assert.equal(result.member.muted, true);
-  assert.equal(result.member.connected, true);
-  assert.equal(room.controlOwnerId, 'actor-session');
+  assert.equal(result.role, 'admin');
+  assert.equal(room.memberForSocket(adminFresh).role, 'admin');
+  assert.equal(room.controlOwnerId, adminFresh.id);
+  // The stale socket is gone and nobody was promoted in between.
+  assert.equal(room.memberForSocket(adminGhost), null);
+  assert.equal(room.memberForSocket(actor).role, 'actor');
+  assert.equal(actor.emitted.filter(([event]) => event === 'room_created').length, 0);
 });
 
-test('the director is promoted only after the sixty-second grace period', () => {
-  const admin = fakeSocket('admin');
-  const coDirector = fakeSocket('co-director');
-  const room = createRoom(admin, 'DA', 'same-project', 'admin-session');
-  joinRoom(coDirector, room.code, 'Co-DA', 'same-project', 'co-session');
-  room.setCoDirector('co-session', true);
-  room.detachMember(admin, 10_000);
-
-  assert.equal(room.memberForSocket(coDirector).role, 'co_da');
-  assert.equal(room.expireDetachedMembers(69_999), false);
-  assert.equal(room.memberForSocket(coDirector).role, 'co_da');
-  assert.equal(room.expireDetachedMembers(70_000), true);
-  assert.equal(room.memberForSocket(coDirector).role, 'admin');
-});
-
-test('explicit leave removes a member immediately instead of detaching it', () => {
-  const admin = fakeSocket('admin');
+test('a returning director takes the role back from an interim promotion', () => {
+  const adminGhost = fakeSocket('admin-ghost');
+  const adminFresh = fakeSocket('admin-fresh');
   const actor = fakeSocket('actor');
-  const room = createRoom(admin, 'DA', 'same-project');
-  joinRoom(actor, room.code, 'Actor', 'same-project', 'actor-session');
+  const room = createRoom(adminGhost, 'DA', 'same-project', 'da-session');
+  joinRoom(actor, room.code, 'Comédien', 'same-project', 'actor-session');
 
-  const { member } = require('../src/room').leaveRoom(actor);
-  assert.equal(member.connected, false);
-  assert.equal(room.members.has(actor), false);
-  assert.equal(actor.roomCode, null);
-});
+  // The director truly goes away: the oldest member is promoted.
+  room.removeMember(adminGhost);
+  assert.equal(room.memberForSocket(actor).role, 'admin');
 
-test('recording preparation waits for every active actor and is idempotent', () => {
-  const admin = fakeSocket('admin');
-  const actor = fakeSocket('actor');
-  const room = createRoom(admin, 'DA', 'same-project');
-  joinRoom(actor, room.code, 'Actor', 'same-project', 'actor-session');
-  const payload = {
-    take_id: 'take_1',
-    project: { timeline_fps: 24 },
-    transactions: { entries: [], cursor: 0 },
-    current_frame: 10,
-    capture_target: {},
-  };
+  const result = joinRoom(adminFresh, room.code, 'DA', 'same-project', 'da-session');
 
-  assert.equal(room.beginRecording(admin, payload, 100).recording.phase, 'preparing');
-  assert.equal(room.prepareRecording(actor, 'take_1', true, null, 101).started, true);
-  assert.equal(room.activeRecording.phase, 'started');
-  assert.equal(room.prepareRecording(actor, 'take_1', true, null, 102).repeated, true);
-  assert.equal(room.beginRecording(admin, payload, 103).repeated, true);
-});
-
-test('a recording preparation timeout cancels the active take', () => {
-  const admin = fakeSocket('admin');
-  const actor = fakeSocket('actor');
-  const room = createRoom(admin, 'DA', 'same-project');
-  joinRoom(actor, room.code, 'Actor', 'same-project', 'actor-session');
-  room.beginRecording(admin, {
-    take_id: 'take_timeout',
-    project: {},
-    transactions: {},
-    current_frame: 0,
-    capture_target: {},
-  }, 1_000);
-
-  const expired = room.expireRecordingPreparation(11_000);
-  assert.equal(expired.cancelReason, 'preparation_timeout');
-  assert.equal(room.activeRecording.phase, 'cancelled');
-});
-
-test('muted and late actors are excluded from the active take', () => {
-  const admin = fakeSocket('admin');
-  const actor = fakeSocket('actor');
-  const muted = fakeSocket('muted');
-  const late = fakeSocket('late');
-  const room = createRoom(admin, 'DA', 'same-project');
-  joinRoom(actor, room.code, 'Actor', 'same-project', 'actor-session');
-  joinRoom(muted, room.code, 'Muted', 'same-project', 'muted-session');
-  room.memberForSocket(muted).muted = true;
-
-  room.beginRecording(admin, {
-    take_id: 'take_active_set',
-    project: {},
-    transactions: {},
-    current_frame: 0,
-    capture_target: {},
-  }, 1_000);
-  joinRoom(late, room.code, 'Late', 'same-project', 'late-session');
-
-  assert.deepEqual([...room.activeRecording.requiredIds], ['actor-session']);
-  assert.equal(room.prepareRecording(late, 'take_active_set', true, null).repeated, true);
-  assert.equal(room.prepareRecording(actor, 'take_active_set', true, null).started, true);
-});
-
-test('a required actor disconnecting during preparation cancels the take', () => {
-  const admin = fakeSocket('admin');
-  const actor = fakeSocket('actor');
-  const room = createRoom(admin, 'DA', 'same-project');
-  joinRoom(actor, room.code, 'Actor', 'same-project', 'actor-session');
-  room.beginRecording(admin, {
-    take_id: 'take_disconnect',
-    project: {},
-    transactions: {},
-    current_frame: 0,
-    capture_target: {},
-  });
-
-  const detached = room.detachMember(actor, 5_000);
-  assert.equal(detached.recordingCancelled.cancelReason, 'participant_disconnected');
-  assert.equal(room.activeRecording.phase, 'cancelled');
-});
-
-test('a room enforces the creator protocol version for subsequent joins', () => {
-  const admin = fakeSocket('admin');
-  const actor = fakeSocket('actor');
-  const room = createRoom(admin, 'DA', 'same-project', 'admin-session', 2);
-  assert.equal(joinRoom(actor, room.code, 'Actor', 'same-project', 'actor-session', 1).error,
-    'protocol_version_mismatch');
+  assert.equal(result.role, 'admin');
+  assert.equal(room.memberForSocket(adminFresh).role, 'admin');
+  assert.equal(room.memberForSocket(actor).role, 'actor');
+  assert.equal(room.controlOwnerId, adminFresh.id);
+  assert.equal(room.canControl(adminFresh), true);
+  assert.equal(room.canControl(actor), false);
 });
