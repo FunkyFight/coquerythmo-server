@@ -24,6 +24,9 @@ class Room {
       previousIntegrity: ZERO_INTEGRITY,
     };
     this.projectTransfer = null;
+    // transfer_id -> chunked `big_*` relay state. The server never
+    // reassembles payloads; it only enforces ordering, bounds and routing.
+    this.bigTransfers = new Map();
     this.addMember(adminSocket, adminUsername, 'admin', adminSessionId);
   }
 
@@ -41,6 +44,7 @@ class Room {
 
   removeMember(socket, suppressPromotion = false) {
     const member = this.members.get(socket);
+    this.dropBigTransfersOf(socket);
     this.members.delete(socket);
     socket.roomCode = null;
 
@@ -453,6 +457,83 @@ class Room {
     this.projectTransfer.phase = 'cancelled';
     this.projectTransfer.cancelReason = reason;
     return true;
+  }
+
+  beginBigTransfer(socket, data, now = Date.now()) {
+    const member = this.memberForSocket(socket);
+    if (!member) return { error: 'not_in_room' };
+    // Authorization matches the legacy single-frame events: a chunked
+    // recording_prepare requires recording control, a chunked sync only
+    // requires membership.
+    if (data.event === 'recording_prepare' && !this.canControl(socket)) {
+      return { error: 'recording_control_required' };
+    }
+    if (this.bigTransfers.has(data.transfer_id)) return { error: 'big_transfer_id_duplicate' };
+    let targetMemberId = null;
+    if (data._target !== undefined && data._target !== null) {
+      const entry = this.memberEntryById(data._target);
+      if (!entry) return { error: 'invalid_big_transfer_target' };
+      targetMemberId = entry[1].id;
+    }
+    const transfer = {
+      senderId: member.id,
+      event: data.event,
+      targetMemberId,
+      nextIndex: 0,
+      receivedBytes: 0,
+      totalBytes: data.total_bytes,
+      totalChunks: data.total_chunks,
+      chunkSize: data.chunk_size,
+      lastActivity: now,
+    };
+    this.bigTransfers.set(data.transfer_id, transfer);
+    return { transfer };
+  }
+
+  bigChunk(socket, data, validation, now = Date.now()) {
+    const transfer = this.bigTransfers.get(data?.transfer_id);
+    if (!transfer) return { error: 'unknown_big_transfer' };
+    const member = this.memberForSocket(socket);
+    if (!member || transfer.senderId !== member.id) return { error: 'big_transfer_sender_mismatch' };
+    if (validation.error) return validation;
+    transfer.nextIndex += 1;
+    transfer.receivedBytes += validation.bytes;
+    transfer.lastActivity = now;
+    return { transfer };
+  }
+
+  endBigTransfer(socket, transferId) {
+    const transfer = this.bigTransfers.get(transferId);
+    if (!transfer) return { error: 'unknown_big_transfer' };
+    const member = this.memberForSocket(socket);
+    if (!member || transfer.senderId !== member.id) return { error: 'big_transfer_sender_mismatch' };
+    this.bigTransfers.delete(transferId);
+    if (transfer.nextIndex !== transfer.totalChunks
+      || transfer.receivedBytes !== transfer.totalBytes) {
+      return { error: 'big_transfer_ended_before_completion' };
+    }
+    return { transfer };
+  }
+
+  dropBigTransfersOf(socket) {
+    const member = this.members.get(socket);
+    if (!member) return;
+    for (const [transferId, transfer] of this.bigTransfers) {
+      if (transfer.senderId === member.id || transfer.targetMemberId === member.id) {
+        this.bigTransfers.delete(transferId);
+      }
+    }
+  }
+
+  expireBigTransfers(now = Date.now(), timeoutMs) {
+    const expired = [];
+    for (const [transferId, transfer] of this.bigTransfers) {
+      if (now - transfer.lastActivity > timeoutMs) {
+        this.bigTransfers.delete(transferId);
+        expired.push({ transferId, senderId: transfer.senderId });
+      }
+    }
+    return expired;
   }
 }
 

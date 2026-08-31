@@ -357,3 +357,109 @@ test('a returning director takes the role back from an interim promotion', () =>
   assert.equal(room.canControl(adminFresh), true);
   assert.equal(room.canControl(actor), false);
 });
+
+function bigBegin(overrides = {}) {
+  return {
+    transfer_id: 'big_1',
+    event: 'sync',
+    total_bytes: 2,
+    total_chunks: 1,
+    chunk_size: 256 * 1024,
+    sha1: 'a'.repeat(40),
+    ...overrides,
+  };
+}
+
+test('a chunked sync can target one member or broadcast to the room', () => {
+  const admin = fakeSocket('admin');
+  const actor = fakeSocket('actor');
+  const room = createRoom(admin, 'DA', 'same-project');
+  joinRoom(actor, room.code, 'Comédien', 'same-project');
+
+  const broadcast = room.beginBigTransfer(admin, bigBegin());
+  assert.equal(broadcast.transfer.targetMemberId, null);
+
+  const targeted = room.beginBigTransfer(
+    admin,
+    bigBegin({ transfer_id: 'big_2', _target: actor.id }),
+  );
+  assert.equal(targeted.transfer.targetMemberId, actor.id);
+
+  assert.equal(
+    room.beginBigTransfer(admin, bigBegin({ transfer_id: 'big_3', _target: 'ghost' })).error,
+    'invalid_big_transfer_target',
+  );
+});
+
+test('a chunked recording_prepare requires recording control', () => {
+  const admin = fakeSocket('admin');
+  const actor = fakeSocket('actor');
+  const room = createRoom(admin, 'DA', 'same-project');
+  joinRoom(actor, room.code, 'Comédien', 'same-project');
+
+  assert.equal(
+    room.beginBigTransfer(actor, bigBegin({ event: 'recording_prepare' })).error,
+    'recording_control_required',
+  );
+  assert.equal(
+    room.beginBigTransfer(admin, bigBegin({ event: 'recording_prepare' })).error,
+    undefined,
+  );
+  // Any member may still chunk a sync.
+  assert.equal(room.beginBigTransfer(actor, bigBegin({ transfer_id: 'big_2' })).error, undefined);
+});
+
+test('big transfer ids are unique per room and chunks must be sequential', () => {
+  const admin = fakeSocket('admin');
+  const room = createRoom(admin, 'DA', 'same-project');
+
+  room.beginBigTransfer(admin, bigBegin());
+  assert.equal(room.beginBigTransfer(admin, bigBegin()).error, 'big_transfer_id_duplicate');
+
+  const chunk = { transfer_id: 'big_1', index: 0, data: 'aGk=' };
+  assert.match(room.bigChunk(admin, chunk, { error: 'out of order' }).error, /out of order/);
+  assert.equal(room.bigChunk(admin, chunk, { bytes: 2 }).transfer.receivedBytes, 2);
+  assert.equal(room.endBigTransfer(admin, 'big_1').transfer.event, 'sync');
+  assert.equal(room.bigTransfers.size, 0);
+});
+
+test('an incomplete big transfer cannot end and foreign senders are rejected', () => {
+  const admin = fakeSocket('admin');
+  const actor = fakeSocket('actor');
+  const room = createRoom(admin, 'DA', 'same-project');
+  joinRoom(actor, room.code, 'Comédien', 'same-project');
+
+  room.beginBigTransfer(admin, bigBegin({ total_bytes: 4, total_chunks: 2 }));
+  room.bigChunk(admin, { transfer_id: 'big_1', index: 0 }, { bytes: 2 });
+  assert.equal(
+    room.bigChunk(actor, { transfer_id: 'big_1', index: 1 }, { bytes: 2 }).error,
+    'big_transfer_sender_mismatch',
+  );
+  assert.equal(room.endBigTransfer(admin, 'big_1').error, 'big_transfer_ended_before_completion');
+  // The transfer is consumed by endBigTransfer even when it fails.
+  assert.equal(room.bigTransfers.size, 0);
+});
+
+test('big transfers expire and leave with their sender or target', () => {
+  const admin = fakeSocket('admin');
+  const actor = fakeSocket('actor');
+  const room = createRoom(admin, 'DA', 'same-project');
+  joinRoom(actor, room.code, 'Comédien', 'same-project');
+
+  room.beginBigTransfer(admin, bigBegin(), 1000);
+  room.beginBigTransfer(admin, bigBegin({ transfer_id: 'big_2', _target: actor.id }), 1000);
+  room.beginBigTransfer(admin, bigBegin({ transfer_id: 'big_3' }), 1000);
+
+  assert.deepEqual(room.expireBigTransfers(1000 + 599_999, 600_000), []);
+  const expired = room.expireBigTransfers(1000 + 600_001, 600_000);
+  assert.equal(expired.length, 3);
+  assert.equal(room.bigTransfers.size, 0);
+
+  room.beginBigTransfer(admin, bigBegin({ transfer_id: 'big_4', _target: actor.id }));
+  room.beginBigTransfer(actor, bigBegin({ transfer_id: 'big_5' }));
+  room.beginBigTransfer(admin, bigBegin({ transfer_id: 'big_6' }));
+  room.removeMember(actor);
+  // The transfer targeting the departed member and the one it sent are gone;
+  // unrelated transfers survive.
+  assert.deepEqual([...room.bigTransfers.keys()], ['big_6']);
+});

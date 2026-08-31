@@ -2,6 +2,9 @@ const AUDIO_CHUNK_MAX_BYTES = 256 * 1024;
 const AUDIO_MAX_BYTES = 4 * 1024 * 1024 * 1024;
 const PROJECT_CHUNK_MAX_BYTES = 192 * 1024;
 const PROJECT_MAX_BYTES = 64 * 1024 * 1024 * 1024;
+const BIG_CHUNK_MAX_BYTES = 256 * 1024;
+const BIG_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const BIG_EVENTS = new Set(['sync', 'recording_prepare']);
 const MAX_RECORDING_TRANSACTION_BYTES = 4 * 1024 * 1024;
 const MAX_RECORDING_ENTRIES = 10000;
 const MAX_BATCH_OPERATIONS = 1024;
@@ -337,6 +340,54 @@ function validateAudioChunk(data, transfer) {
   return { bytes: decoded.length };
 }
 
+function validateBigBegin(data) {
+  if (!isObject(data)) return { error: 'big transfer payload is invalid' };
+  if (typeof data.transfer_id !== 'string' || !/^[A-Za-z0-9_-]{1,96}$/.test(data.transfer_id)) {
+    return { error: 'big transfer id is invalid' };
+  }
+  if (typeof data.event !== 'string' || !BIG_EVENTS.has(data.event)) {
+    return { error: 'big transfer event is invalid' };
+  }
+  if (!Number.isSafeInteger(data.total_bytes) || data.total_bytes <= 0
+    || data.total_bytes > BIG_MAX_BYTES) {
+    return { error: 'big transfer size is invalid' };
+  }
+  if (!Number.isSafeInteger(data.total_chunks) || data.total_chunks <= 0
+    || !Number.isSafeInteger(data.chunk_size) || data.chunk_size <= 0
+    || data.chunk_size > BIG_CHUNK_MAX_BYTES
+    || data.total_chunks !== Math.ceil(data.total_bytes / data.chunk_size)) {
+    return { error: 'big transfer chunk geometry is invalid' };
+  }
+  if (typeof data.sha1 !== 'string' || !/^[a-f0-9]{40}$/.test(data.sha1)) {
+    return { error: 'big transfer SHA-1 is invalid' };
+  }
+  if (data._target !== undefined && data._target !== null
+    && (typeof data._target !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(data._target))) {
+    return { error: 'big transfer target is invalid' };
+  }
+  return { bytes: data.total_bytes };
+}
+
+function validateBigChunk(data, transfer) {
+  if (!isObject(data) || typeof data.transfer_id !== 'string'
+    || !/^[A-Za-z0-9_-]{1,96}$/.test(data.transfer_id)
+    || !Number.isSafeInteger(data.index) || data.index < 0) {
+    return { error: 'big chunk header is invalid' };
+  }
+  if (!transfer) return { error: 'unknown big transfer' };
+  if (data.index !== transfer.nextIndex) {
+    return { error: `big chunk out of order: expected ${transfer.nextIndex}` };
+  }
+  const decoded = decodeCanonicalBase64(data.data);
+  if (!decoded || decoded.length === 0 || decoded.length > transfer.chunkSize) {
+    return { error: 'big chunk base64 or size is invalid' };
+  }
+  if (transfer.receivedBytes + decoded.length > transfer.totalBytes) {
+    return { error: 'big transfer exceeds announced size' };
+  }
+  return { bytes: decoded.length };
+}
+
 function expiredTransferIds(transfers, now, timeout) {
   return [...transfers]
     .filter(([, transfer]) => now - transfer.lastActivity > timeout)
@@ -350,6 +401,8 @@ function relayAudio(room, sender, event, data) {
 module.exports = {
   AUDIO_CHUNK_MAX_BYTES,
   AUDIO_MAX_BYTES,
+  BIG_CHUNK_MAX_BYTES,
+  BIG_MAX_BYTES,
   PROJECT_CHUNK_MAX_BYTES,
   PROJECT_MAX_BYTES,
   MAX_RECORDING_TRANSACTION_BYTES,
@@ -359,6 +412,8 @@ module.exports = {
   relayAudio,
   validateAudioChunk,
   validateAudioStart,
+  validateBigBegin,
+  validateBigChunk,
   validateProjectChunk,
   validateProjectStart,
   validateRecordingLog,

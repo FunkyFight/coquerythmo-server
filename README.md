@@ -107,6 +107,10 @@ See `src/index.js` for full protocol. Main events:
 - `create_room` / `join_room` — Room management
 - `request_sync` / `sync` — Project synchronization
 - `command` / `delta` — Real-time collaboration
+- `big_begin` / `big_chunk` / `big_end` — Chunked relay of oversized `sync` and
+  `recording_prepare` payloads (> 256 KiB serialized; 256 KiB canonical-base64
+  chunks, sequential indexes, global SHA-1, 2 GiB cap, 10 min inactivity
+  timeout). The server validates and relays without reassembling.
 - Audio/video transfer events
 
 ## Development

@@ -7,6 +7,8 @@ const { createRoom, joinRoom, leaveRoom, getRoom, rooms } = require('./room');
 const {
   validateAudioChunk,
   validateAudioStart,
+  validateBigBegin,
+  validateBigChunk,
   validateProjectChunk,
   validateProjectStart,
   validateRecordingDisplaySettings,
@@ -23,6 +25,8 @@ const MOTD = process.env.MOTD || '';
 const SERVER_IP = process.env.SERVER_IP || '';
 const AUDIO_TRANSFER_TIMEOUT_MINUTES = 30;
 const AUDIO_TRANSFER_TIMEOUT = AUDIO_TRANSFER_TIMEOUT_MINUTES * 60 * 1000;
+const BIG_TRANSFER_TIMEOUT_MINUTES = 10;
+const BIG_TRANSFER_TIMEOUT = BIG_TRANSFER_TIMEOUT_MINUTES * 60 * 1000;
 const MAX_ACTIVE_AUDIO_TRANSFERS = 1;
 const bannedIps = new Set();
 
@@ -259,6 +263,47 @@ io.on('connection', (socket) => {
     } else {
       socket.to(room.code).emit('recording_prepare', payload);
     }
+  });
+
+  // Chunked relay for payloads too large for a single websocket frame. The
+  // server validates geometry and ordering, then relays each frame untouched:
+  // reassembly and integrity checks happen on the receiving client.
+  socket.on('big_begin', (data) => {
+    const room = getRoom(socket);
+    if (!room) return socket.emit('server_error', { message: 'Not in a room' });
+    const validation = validateBigBegin(data);
+    if (validation.error) {
+      return socket.emit('server_error', { message: `Invalid big transfer: ${validation.error}` });
+    }
+    const result = room.beginBigTransfer(socket, data);
+    if (result.error) return socket.emit('server_error', { message: result.error });
+    relayBigEvent(room, socket, 'big_begin', data, result.transfer.targetMemberId);
+  });
+
+  socket.on('big_chunk', (data) => {
+    const room = getRoom(socket);
+    if (!room) return socket.emit('server_error', { message: 'Not in a room' });
+    const transfer = room.bigTransfers.get(data?.transfer_id);
+    const validation = validateBigChunk(data, transfer);
+    const result = room.bigChunk(socket, data, validation);
+    if (result.error) {
+      // A protocol error aborts the transfer: the sender must start over
+      // with a fresh big_begin instead of guessing the remaining state.
+      if (transfer) room.bigTransfers.delete(data.transfer_id);
+      return socket.emit('server_error', { message: `Invalid big chunk: ${result.error}` });
+    }
+    relayBigEvent(room, socket, 'big_chunk', data, result.transfer.targetMemberId);
+  });
+
+  socket.on('big_end', (data) => {
+    const room = getRoom(socket);
+    if (!room) return socket.emit('server_error', { message: 'Not in a room' });
+    if (typeof data?.transfer_id !== 'string') {
+      return socket.emit('server_error', { message: 'Invalid big transfer id' });
+    }
+    const result = room.endBigTransfer(socket, data.transfer_id);
+    if (result.error) return socket.emit('server_error', { message: result.error });
+    relayBigEvent(room, socket, 'big_end', data, result.transfer.targetMemberId);
   });
 
   socket.on('recording_capture', (data) => {
@@ -675,6 +720,16 @@ function memberSocketInRoom(room, memberId) {
   return room.memberEntryById(memberId)?.[0] || null;
 }
 
+function relayBigEvent(room, socket, event, data, targetMemberId) {
+  const payload = { ...data };
+  delete payload._target;
+  if (targetMemberId) {
+    memberSocketInRoom(room, targetMemberId)?.emit(event, payload);
+  } else {
+    socket.to(room.code).emit(event, payload);
+  }
+}
+
 function sessionIdFrom(data) {
   return typeof data?.session_id === 'string'
     && /^[A-Za-z0-9_-]{1,128}$/.test(data.session_id)
@@ -712,6 +767,12 @@ function expireAudioTransfers() {
   for (const [, room] of rooms) {
     const changed = room.expireProjectTransferResponses(now) || room.expireProjectTransfer(now);
     if (changed) emitProjectTransferStatus(room);
+    for (const expired of room.expireBigTransfers(now, BIG_TRANSFER_TIMEOUT)) {
+      const sender = room.memberEntryById(expired.senderId);
+      sender?.[0].emit('server_error', {
+        message: `Big transfer ${expired.transferId} expired after ${BIG_TRANSFER_TIMEOUT_MINUTES} minutes of inactivity`,
+      });
+    }
   }
 }
 

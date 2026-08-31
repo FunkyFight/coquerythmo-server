@@ -6,6 +6,8 @@ const {
   expiredTransferIds,
   validateAudioChunk,
   validateAudioStart,
+  validateBigBegin,
+  validateBigChunk,
   validateProjectChunk,
   validateProjectStart,
   validateRecordingDisplaySettings,
@@ -200,4 +202,57 @@ test('recording batches are bounded', () => {
   };
   const tx = transaction(0, ZERO_INTEGRITY, value);
   assert.match(validateRecordingTransaction(tx).error, /batch/);
+});
+
+test('big transfer geometry is validated like audio transfers', () => {
+  const begin = {
+    transfer_id: 'big_1',
+    event: 'sync',
+    total_bytes: 300 * 1024,
+    total_chunks: 2,
+    chunk_size: 256 * 1024,
+    sha1: 'a'.repeat(40),
+  };
+  assert.equal(validateBigBegin(begin).error, undefined);
+  assert.equal(validateBigBegin({ ...begin, _target: 'member-1' }).error, undefined);
+
+  assert.match(validateBigBegin({ ...begin, transfer_id: 'bad id' }).error, /id/);
+  assert.match(validateBigBegin({ ...begin, event: 'recording_view' }).error, /event/);
+  assert.match(validateBigBegin({ ...begin, total_chunks: 1 }).error, /geometry/);
+  assert.match(
+    validateBigBegin({ ...begin, chunk_size: 256 * 1024 + 1 }).error,
+    /geometry/,
+  );
+  assert.match(
+    validateBigBegin({ ...begin, total_bytes: 2 * 1024 * 1024 * 1024 + 1 }).error,
+    /size/,
+  );
+  assert.match(validateBigBegin({ ...begin, sha1: 'A'.repeat(40) }).error, /SHA-1/);
+  assert.match(validateBigBegin({ ...begin, _target: 'bad target' }).error, /target/);
+});
+
+test('big chunks enforce sequential indexes and canonical base64', () => {
+  const transfer = {
+    nextIndex: 0,
+    receivedBytes: 0,
+    totalBytes: 2,
+    chunkSize: 256 * 1024,
+  };
+  assert.equal(validateBigChunk({ transfer_id: 'big_1', index: 0, data: 'aGk=' }, transfer).bytes, 2);
+  assert.match(
+    validateBigChunk({ transfer_id: 'big_1', index: 0, data: 'aGk=' }, null).error,
+    /unknown/,
+  );
+  assert.match(
+    validateBigChunk({ transfer_id: 'big_1', index: 1, data: 'aGk=' }, transfer).error,
+    /out of order/,
+  );
+  assert.match(
+    validateBigChunk({ transfer_id: 'big_1', index: 0, data: 'aGk' }, transfer).error,
+    /base64|size/,
+  );
+  assert.match(
+    validateBigChunk({ transfer_id: 'big_1', index: 0, data: 'aGkKaGk=' }, transfer).error,
+    /announced size/,
+  );
 });
