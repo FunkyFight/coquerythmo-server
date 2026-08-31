@@ -16,6 +16,9 @@ class Room {
     this.projectHuuid = projectHuuid;
     this.members = new Map(); // socket -> { id, username, role, muted }
     this.controlOwnerId = adminSocket.id;
+    // Session of the founding director: a reconnect with the same session id
+    // restores the admin role instead of landing in the room as an actor.
+    this.adminSessionId = adminSessionId;
     this.recordingChain = {
       nextSequence: 0,
       previousIntegrity: ZERO_INTEGRITY,
@@ -36,7 +39,7 @@ class Room {
     socket.roomCode = this.code;
   }
 
-  removeMember(socket) {
+  removeMember(socket, suppressPromotion = false) {
     const member = this.members.get(socket);
     this.members.delete(socket);
     socket.roomCode = null;
@@ -58,8 +61,10 @@ class Room {
       }
     }
 
-    // Promote oldest member to admin if the admin left
-    if (member && member.role === 'admin' && this.members.size > 0) {
+    // Promote oldest member to admin if the admin left. Promotion is
+    // suppressed when the director's own session is rejoining right away:
+    // the role is restored on the fresh socket instead.
+    if (!suppressPromotion && member && member.role === 'admin' && this.members.size > 0) {
       const [firstSocket, firstMember] = this.members.entries().next().value;
       firstMember.role = 'admin';
       this.controlOwnerId = firstSocket.id;
@@ -90,11 +95,11 @@ class Room {
     return this.members.get(socket) || null;
   }
 
-  replaceMemberForSession(sessionId) {
+  replaceMemberForSession(sessionId, suppressPromotion = false) {
     if (!sessionId) return null;
     for (const [socket, member] of this.members) {
       if (member.sessionId === sessionId) {
-        return this.removeMember(socket);
+        return this.removeMember(socket, suppressPromotion);
       }
     }
     return null;
@@ -466,11 +471,26 @@ function createRoom(socket, username, projectHuuid, sessionId = null) {
 function joinRoom(socket, code, username, projectHuuid, sessionId = null) {
   const room = rooms.get(code);
   if (!room) return { error: 'room_not_found' };
-  room.replaceMemberForSession(sessionId);
-  room.addMember(socket, username, 'actor', sessionId);
+  // A reconnect keeps the client's session id. When it matches the founding
+  // director's session, restore the admin role on the fresh socket instead of
+  // creating a parallel room or leaving an interim promoted member in charge.
+  const returningAdmin = Boolean(sessionId) && room.adminSessionId === sessionId;
+  if (returningAdmin) {
+    room.replaceMemberForSession(sessionId, true);
+    // Demote any member promoted while the director was away.
+    for (const [, member] of room.members) {
+      if (member.role === 'admin') member.role = 'actor';
+    }
+  } else {
+    room.replaceMemberForSession(sessionId);
+  }
+  const role = returningAdmin ? 'admin' : 'actor';
+  room.addMember(socket, username, role, sessionId);
+  if (returningAdmin) room.controlOwnerId = socket.id;
   const reconnected = room.reattachProjectTransfer(socket, username, sessionId);
   return {
     room,
+    role,
     projectMatches: Boolean(projectHuuid && room.projectHuuid === projectHuuid),
     reconnected,
   };

@@ -138,7 +138,7 @@ io.on('connection', (socket) => {
     socket.join(room.code);
     socket.emit('room_joined', {
       code: room.code,
-      role: 'actor',
+      role: result.role,
       members: room.getMemberUsernames(),
       project_huuid: room.projectHuuid,
       project_matches: result.projectMatches,
@@ -198,6 +198,9 @@ io.on('connection', (socket) => {
       }
     }
     console.log('[sync] No admin found');
+    // Surface the failure instead of letting the requester wait forever on a
+    // sync that can never arrive.
+    socket.emit('server_error', { message: 'No director available to synchronize' });
   });
 
   // --- Sync data (admin -> specific requester or broadcast) ---

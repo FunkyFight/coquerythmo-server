@@ -318,3 +318,42 @@ test('actors stay unready until their microphone preflight succeeds', () => {
   assert.equal(room.setRecordingReady(actor, true), true);
   assert.equal(room.memberForSocket(actor).recording_ready, true);
 });
+
+test('a reconnecting director restores the admin role without a promotion', () => {
+  const adminGhost = fakeSocket('admin-ghost');
+  const adminFresh = fakeSocket('admin-fresh');
+  const actor = fakeSocket('actor');
+  const room = createRoom(adminGhost, 'DA', 'same-project', 'da-session');
+  joinRoom(actor, room.code, 'Comédien', 'same-project', 'actor-session');
+
+  const result = joinRoom(adminFresh, room.code, 'DA', 'same-project', 'da-session');
+
+  assert.equal(result.role, 'admin');
+  assert.equal(room.memberForSocket(adminFresh).role, 'admin');
+  assert.equal(room.controlOwnerId, adminFresh.id);
+  // The stale socket is gone and nobody was promoted in between.
+  assert.equal(room.memberForSocket(adminGhost), null);
+  assert.equal(room.memberForSocket(actor).role, 'actor');
+  assert.equal(actor.emitted.filter(([event]) => event === 'room_created').length, 0);
+});
+
+test('a returning director takes the role back from an interim promotion', () => {
+  const adminGhost = fakeSocket('admin-ghost');
+  const adminFresh = fakeSocket('admin-fresh');
+  const actor = fakeSocket('actor');
+  const room = createRoom(adminGhost, 'DA', 'same-project', 'da-session');
+  joinRoom(actor, room.code, 'Comédien', 'same-project', 'actor-session');
+
+  // The director truly goes away: the oldest member is promoted.
+  room.removeMember(adminGhost);
+  assert.equal(room.memberForSocket(actor).role, 'admin');
+
+  const result = joinRoom(adminFresh, room.code, 'DA', 'same-project', 'da-session');
+
+  assert.equal(result.role, 'admin');
+  assert.equal(room.memberForSocket(adminFresh).role, 'admin');
+  assert.equal(room.memberForSocket(actor).role, 'actor');
+  assert.equal(room.controlOwnerId, adminFresh.id);
+  assert.equal(room.canControl(adminFresh), true);
+  assert.equal(room.canControl(actor), false);
+});
