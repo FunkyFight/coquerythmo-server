@@ -20,6 +20,7 @@ const PORT = parseInt(process.env.PORT || '9050', 10);
 const SERVER_NAME = process.env.SERVER_NAME || 'Coquerythmo Server';
 const MAX_SLOTS = parseInt(process.env.MAX_SLOTS || '20', 10);
 const MOTD = process.env.MOTD || '';
+const SERVER_IP = process.env.SERVER_IP || '';
 const AUDIO_TRANSFER_TIMEOUT_MINUTES = 30;
 const AUDIO_TRANSFER_TIMEOUT = AUDIO_TRANSFER_TIMEOUT_MINUTES * 60 * 1000;
 const MAX_ACTIVE_AUDIO_TRANSFERS = 1;
@@ -34,8 +35,9 @@ const io = new Server(httpServer, {
 // HTTP /info endpoint for server browser ping (replaces websocket ping_server)
 httpServer.on('request', (req, res) => {
   if (req.method === 'GET' && req.url?.startsWith('/info')) {
-    const url = new URL(req.url, `http://localhost:${PORT}`);
-    const providedPassword = url.searchParams.get('password') || '';
+    const queryIndex = req.url.indexOf('?');
+    const query = queryIndex >= 0 ? req.url.slice(queryIndex + 1) : '';
+    const providedPassword = new URLSearchParams(query).get('password') || '';
     if (!validatePassword(providedPassword)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Invalid password' }));
@@ -46,13 +48,15 @@ httpServer.on('request', (req, res) => {
       online += room.members.size;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    const info = {
       name: SERVER_NAME,
       motd: MOTD,
       max_slots: MAX_SLOTS,
       online,
       rooms: rooms.size,
-    }));
+    };
+    if (SERVER_IP) info.ip = SERVER_IP;
+    res.end(JSON.stringify(info));
     return;
   }
   res.writeHead(404);

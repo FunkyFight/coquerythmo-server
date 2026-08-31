@@ -21,6 +21,7 @@ Environment variables (set before `npm start`):
 | `SERVER_NAME` | `Coquerythmo Server` | Display name in server browser |
 | `MAX_SLOTS` | `20` | Max concurrent users |
 | `MOTD` | `` | Message of the day |
+| `SERVER_IP` | *(none)* | External IP/hostname for clients to connect (e.g. `38.87.117.194` or `myserver.com`). If set, included in `/info` response. |
 | `PASSWORD` | *(none)* | Optional server password. If set, clients must provide it. |
 
 Example (PowerShell):
@@ -28,13 +29,14 @@ Example (PowerShell):
 $env:PORT = "9050"
 $env:SERVER_NAME = "My Server"
 $env:MAX_SLOTS = "50"
+$env:SERVER_IP = "38.87.117.194"
 $env:PASSWORD = "secret123"
 npm start
 ```
 
 Example (bash):
 ```bash
-PORT=9050 SERVER_NAME="My Server" MAX_SLOTS=50 PASSWORD=secret123 npm start
+PORT=9050 SERVER_NAME="My Server" MAX_SLOTS=50 SERVER_IP="38.87.117.194" PASSWORD=secret123 npm start
 ```
 
 ## HTTP Endpoint
@@ -48,11 +50,55 @@ Response:
   "motd": "Welcome",
   "max_slots": 20,
   "online": 5,
-  "rooms": 2
+  "rooms": 2,
+  "ip": "38.87.117.194"
 }
 ```
 
+The `ip` field is only present if `SERVER_IP` environment variable is set.
+
 Returns `401` with `{"error": "Invalid password"}` if password is required but missing/incorrect.
+
+## Manual Ping (Health Check)
+
+Test if the server is running and responding:
+
+**PowerShell:**
+```powershell
+# Without password
+Invoke-WebRequest -Uri "http://localhost:9050/info" -Method GET | Select-Object -ExpandProperty Content
+
+# With password
+Invoke-WebRequest -Uri "http://localhost:9050/info?password=secret123" -Method GET | Select-Object -ExpandProperty Content
+```
+
+**bash / curl:**
+```bash
+# Without password
+curl "http://localhost:9050/info"
+
+# With password
+curl "http://localhost:9050/info?password=secret123"
+```
+
+**Expected output (JSON):**
+```json
+{
+  "name": "Coquerythmo Server",
+  "motd": "Welcome",
+  "max_slots": 20,
+  "online": 5,
+  "rooms": 2,
+  "ip": "38.87.117.194"
+}
+```
+
+The `ip` field is only present if `SERVER_IP` environment variable is set.
+
+If password is required but wrong/missing, returns HTTP 401:
+```json
+{"error": "Invalid password"}
+```
 
 ## WebSocket Events
 
