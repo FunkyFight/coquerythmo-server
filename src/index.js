@@ -133,11 +133,17 @@ io.on('connection', (socket) => {
     socket.username = username;
     const projectHuuid = typeof data.project_huuid === 'string' && data.project_huuid.trim()
       ? data.project_huuid.trim() : null;
+    const projectMode = ['none', 'require_match', 'auto_transfer'].includes(data.project_mode)
+      ? data.project_mode : 'none';
+    const requestedProjectFileName = typeof data.project_file_name === 'string'
+      ? data.project_file_name.trim().substring(0, 256) : null;
     const result = joinRoom(socket, code, username, projectHuuid, sessionIdFrom(data));
     if (result.error === 'room_not_found') {
       return socket.emit('join_error', { reason: 'room_not_found' });
     }
     const room = result.room;
+    const effectiveProjectMode = projectMode === 'none' ? room.projectInvitationMode : projectMode;
+    const effectiveProjectFileName = requestedProjectFileName || room.projectInvitationFileName;
 
     socket.join(room.code);
     socket.emit('room_joined', {
@@ -146,10 +152,20 @@ io.on('connection', (socket) => {
       members: room.getMemberUsernames(),
       project_huuid: room.projectHuuid,
       project_matches: result.projectMatches,
+      project_mode: effectiveProjectMode,
+      project_file_name: effectiveProjectFileName,
       member_id: socket.id,
     });
     socket.to(room.code).emit('member_joined', { username });
     emitRoomState(room);
+    // A transfer request is still created by the director, preserving the
+    // existing permission and checksum flow. The event merely asks the
+    // director client to start it automatically for this invitation.
+    if (effectiveProjectMode === 'auto_transfer') {
+      room.adminEntry()?.[0].emit('project_transfer_auto_request', {
+        member_id: socket.id,
+      });
+    }
     if (result.reconnected) {
       if (result.reconnected.restarted) {
         emitProjectTransferRequests(room);
@@ -348,6 +364,19 @@ io.on('connection', (socket) => {
     const room = getRoom(socket);
     if (!room?.setRecordingReady(socket, data?.ready)) {
       return socket.emit('server_error', { message: 'Invalid recording readiness' });
+    }
+    emitRoomState(room);
+  });
+
+  socket.on('set_project_invitation_mode', (data) => {
+    const room = getRoom(socket);
+    const mode = ['none', 'require_match', 'auto_transfer'].includes(data?.project_mode)
+      ? data.project_mode : null;
+    const fileName = typeof data?.project_file_name === 'string'
+      ? data.project_file_name.trim().substring(0, 256) : null;
+    if (!room || !mode || (mode !== 'none' && (!fileName || !fileName.toLowerCase().endsWith('.coquerythmo')))
+      || !room.setProjectInvitationMode(socket, mode, fileName)) {
+      return socket.emit('server_error', { message: 'Invalid project invitation mode' });
     }
     emitRoomState(room);
   });
@@ -566,13 +595,26 @@ io.on('connection', (socket) => {
     const room = getRoom(socket);
     const member = room?.memberForSocket(socket);
     if (!room || !member) return socket.emit('server_error', { message: 'Not in a room' });
-    if (member.muted) return socket.emit('server_error', { message: 'Audio input is muted' });
+    const isAssetPublication = data?.commit_on_receive === false;
+    if (isAssetPublication && !room.canControl(socket)) {
+      return socket.emit('server_error', { message: 'Recording control is read-only' });
+    }
+    if (member.muted && !isAssetPublication) {
+      return socket.emit('server_error', { message: 'Audio input is muted' });
+    }
     if (socket.audioTransfers.size >= MAX_ACTIVE_AUDIO_TRANSFERS) {
       return socket.emit('server_error', { message: 'Another audio transfer is already active' });
     }
     const validation = validateAudioStart(data);
     if (validation.error) {
       return socket.emit('server_error', { message: `Invalid audio transfer: ${validation.error}` });
+    }
+    const targetMemberId = data.to_member_id || null;
+    if (targetMemberId && !isAssetPublication) {
+      return socket.emit('server_error', { message: 'Recorded takes cannot target one recipient' });
+    }
+    if (targetMemberId && !memberSocketInRoom(room, targetMemberId)) {
+      return socket.emit('server_error', { message: 'Invalid audio recipient' });
     }
     if (socket.audioTransfers.has(data.transfer_id)) return;
     socket.audioTransfers.set(data.transfer_id, {
@@ -581,16 +623,22 @@ io.on('connection', (socket) => {
       totalBytes: data.total_bytes,
       totalChunks: data.total_chunks,
       chunkSize: data.chunk_size,
+      targetMemberId,
       lastActivity: Date.now(),
     });
-    relayAudio(room, socket, 'audio_start', { ...data, from_member_id: member.id });
+    relayAudio(
+      room,
+      socket,
+      'audio_start',
+      { ...data, from_member_id: member.id },
+      targetMemberId,
+    );
   });
 
   socket.on('audio_chunk', (data) => {
     const room = getRoom(socket);
     const member = room?.memberForSocket(socket);
     if (!room || !member) return socket.emit('server_error', { message: 'Not in a room' });
-    if (member.muted) return socket.emit('server_error', { message: 'Audio input is muted' });
     const transfer = socket.audioTransfers.get(data?.transfer_id);
     const validation = validateAudioChunk(data, transfer);
     if (validation.error) {
@@ -599,14 +647,13 @@ io.on('connection', (socket) => {
     transfer.nextIndex += 1;
     transfer.receivedBytes += validation.bytes;
     transfer.lastActivity = Date.now();
-    relayAudio(room, socket, 'audio_chunk', data);
+    relayAudio(room, socket, 'audio_chunk', data, transfer.targetMemberId);
   });
 
   socket.on('audio_end', (data) => {
     const room = getRoom(socket);
     const member = room?.memberForSocket(socket);
     if (!room || !member) return socket.emit('server_error', { message: 'Not in a room' });
-    if (member.muted) return socket.emit('server_error', { message: 'Audio input is muted' });
     if (typeof data?.transfer_id !== 'string') {
       return socket.emit('server_error', { message: 'Invalid audio transfer id' });
     }
@@ -617,7 +664,7 @@ io.on('connection', (socket) => {
       || transfer.receivedBytes !== transfer.totalBytes) {
       return socket.emit('server_error', { message: 'Audio transfer ended before completion' });
     }
-    relayAudio(room, socket, 'audio_end', data);
+    relayAudio(room, socket, 'audio_end', data, transfer.targetMemberId);
     socket.emit('audio_uploaded', { transfer_id: data.transfer_id });
   });
 

@@ -50,6 +50,26 @@ test('audio is relayed to every other room member, including for an actor', () =
   ]);
 });
 
+test('catch-up audio can be relayed to one room member only', () => {
+  const emitted = [];
+  const target = { emit: (event, data) => emitted.push([event, data]) };
+  const room = {
+    code: 'ABC123',
+    memberEntryById(memberId) {
+      return memberId === 'actor-2' ? [target, { id: memberId }] : null;
+    },
+  };
+  const sender = {
+    to() {
+      throw new Error('targeted audio must not be broadcast');
+    },
+  };
+
+  relayAudio(room, sender, 'audio_chunk', { index: 0 }, 'actor-2');
+
+  assert.deepEqual(emitted, [['audio_chunk', { index: 0 }]]);
+});
+
 test('audio transfer metadata and canonical chunks are validated', () => {
   const metadata = {
     transfer_id: 'take_1',
@@ -75,6 +95,10 @@ test('audio transfer metadata and canonical chunks are validated', () => {
   assert.match(
     validateAudioStart({ ...metadata, file_name: '../take.flac' }).error,
     /file name/,
+  );
+  assert.match(
+    validateAudioStart({ ...metadata, commit_on_receive: 'no' }).error,
+    /commit mode/,
   );
   assert.match(
     validateAudioChunk({ transfer_id: 'take_1', index: 1, data: 'aGk=' }, transfer).error,

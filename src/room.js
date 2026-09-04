@@ -14,6 +14,8 @@ class Room {
   constructor(code, adminSocket, adminUsername, projectHuuid, adminSessionId = null) {
     this.code = code;
     this.projectHuuid = projectHuuid;
+    this.projectInvitationMode = 'none';
+    this.projectInvitationFileName = null;
     this.members = new Map(); // socket -> { id, username, role, muted }
     this.controlOwnerId = adminSocket.id;
     // Session of the founding director: a reconnect with the same session id
@@ -153,6 +155,14 @@ class Room {
     return true;
   }
 
+  setProjectInvitationMode(socket, mode, fileName = null) {
+    const member = this.memberForSocket(socket);
+    if (!member || member.role !== 'admin') return false;
+    this.projectInvitationMode = mode;
+    this.projectInvitationFileName = mode === 'none' ? null : fileName;
+    return true;
+  }
+
   getRecordingChain() {
     return { ...this.recordingChain };
   }
@@ -171,9 +181,11 @@ class Room {
     if (this.projectTransfer && !['completed', 'cancelled'].includes(this.projectTransfer.phase)) {
       return { error: 'project_transfer_already_active' };
     }
+    const targetMemberId = typeof metadata.member_id === 'string' ? metadata.member_id : null;
     const participants = {};
     for (const [socket, member] of this.members) {
       if (socket === adminSocket) continue;
+      if (targetMemberId && member.id !== targetMemberId) continue;
       participants[member.id] = {
         memberId: member.id,
         username: member.username,
@@ -183,6 +195,9 @@ class Room {
         socket,
         deadline: now + 60_000,
       };
+    }
+    if (targetMemberId && Object.keys(participants).length === 0) {
+      return { error: 'project_transfer_target_not_found' };
     }
     this.projectTransfer = {
       requestId: metadata.request_id,

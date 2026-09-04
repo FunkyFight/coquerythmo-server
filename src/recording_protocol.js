@@ -249,6 +249,9 @@ function validateAudioStart(data) {
   if (typeof data.sha1 !== 'string' || !/^[a-f0-9]{40}$/.test(data.sha1)) {
     return { error: 'audio transfer SHA-1 is invalid' };
   }
+  if (data.commit_on_receive !== undefined && typeof data.commit_on_receive !== 'boolean') {
+    return { error: 'audio transfer commit mode is invalid' };
+  }
   if (data.to_member_id !== undefined
     && (typeof data.to_member_id !== 'string'
       || !/^[A-Za-z0-9_-]{1,128}$/.test(data.to_member_id))) {
@@ -394,7 +397,12 @@ function expiredTransferIds(transfers, now, timeout) {
     .map(([transferId]) => transferId);
 }
 
-function relayAudio(room, sender, event, data) {
+function relayAudio(room, sender, event, data, targetMemberId = null) {
+  if (targetMemberId) {
+    const target = room.memberEntryById(targetMemberId)?.[0];
+    if (target && target !== sender) target.emit(event, data);
+    return;
+  }
   sender.to(room.code).emit(event, data);
 }
 
