@@ -12,6 +12,7 @@ const {
   validateProjectChunk,
   validateProjectStart,
   validateRecordingDisplaySettings,
+  validateRecordingView,
   validateRecordingPrepare,
   validateRecordingTransaction,
   expiredTransferIds,
@@ -344,15 +345,11 @@ io.on('connection', (socket) => {
     if (!room || caller?.role !== 'admin') return;
     const target = data?._target;
     const targetSocket = target === undefined ? null : memberSocketInRoom(room, target);
-    if (!Number.isSafeInteger(data?.language_id) || data.language_id < 0
-      || typeof data.instrumental !== 'boolean'
-      || (target !== undefined && !targetSocket)) {
+    const validation = validateRecordingView(data);
+    if (validation.error || (target !== undefined && !targetSocket)) {
       return socket.emit('server_error', { message: 'Invalid recording view' });
     }
-    const payload = {
-      language_id: data.language_id,
-      instrumental: data.instrumental,
-    };
+    const payload = validation.payload;
     if (targetSocket) {
       targetSocket.emit('recording_view', payload);
     } else {

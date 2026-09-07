@@ -493,6 +493,7 @@ class Room {
     const transfer = {
       senderId: member.id,
       event: data.event,
+      recordingChain: data.event === 'recording_prepare' ? { ...data.recording_chain } : null,
       targetMemberId,
       nextIndex: 0,
       receivedBytes: 0,
@@ -526,6 +527,10 @@ class Room {
     if (transfer.nextIndex !== transfer.totalChunks
       || transfer.receivedBytes !== transfer.totalBytes) {
       return { error: 'big_transfer_ended_before_completion' };
+    }
+    if (transfer.recordingChain) {
+      if (!this.canControl(socket)) return { error: 'recording_control_required' };
+      this.setRecordingChain(transfer.recordingChain);
     }
     return { transfer };
   }

@@ -209,6 +209,21 @@ function validateRecordingPrepare(data) {
   return validateRecordingLog(data.transactions);
 }
 
+function validateRecordingView(data) {
+  if (!isObject(data) || !isSafeNonNegativeInteger(data.language_id)
+    || typeof data.instrumental !== 'boolean') {
+    return { error: 'Invalid recording view' };
+  }
+  const payload = { language_id: data.language_id, instrumental: data.instrumental };
+  if (data.instrumental_audio_offset_frames !== undefined) {
+    if (!Number.isSafeInteger(data.instrumental_audio_offset_frames)) {
+      return { error: 'Invalid instrumental audio offset' };
+    }
+    payload.instrumental_audio_offset_frames = data.instrumental_audio_offset_frames;
+  }
+  return { payload };
+}
+
 function validateRecordingDisplaySettings(data) {
   if (!isObject(data) || !isFiniteNumber(data.scroll_speed)
     || data.scroll_speed < 0.25 || data.scroll_speed > 4
@@ -351,6 +366,15 @@ function validateBigBegin(data) {
   if (typeof data.event !== 'string' || !BIG_EVENTS.has(data.event)) {
     return { error: 'big transfer event is invalid' };
   }
+  if (data.event === 'recording_prepare') {
+    const chain = data.recording_chain;
+    if (!isObject(chain) || !isSafeNonNegativeInteger(chain.nextSequence)
+      || chain.nextSequence > MAX_RECORDING_ENTRIES
+      || !isHexIntegrity(chain.previousIntegrity)
+      || (chain.nextSequence === 0 && chain.previousIntegrity !== ZERO_INTEGRITY)) {
+      return { error: 'big recording preparation chain is invalid; update the sending client' };
+    }
+  }
   if (!Number.isSafeInteger(data.total_bytes) || data.total_bytes <= 0
     || data.total_bytes > BIG_MAX_BYTES) {
     return { error: 'big transfer size is invalid' };
@@ -426,6 +450,7 @@ module.exports = {
   validateProjectStart,
   validateRecordingLog,
   validateRecordingDisplaySettings,
+  validateRecordingView,
   validateRecordingPrepare,
   validateRecordingTransaction,
 };

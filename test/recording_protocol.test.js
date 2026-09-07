@@ -1,6 +1,19 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+test('recording view relays absolute instrumental offsets and accepts legacy peers', () => {
+  const { validateRecordingView } = require('../src/recording_protocol');
+  for (const offset of [-48, 0, 72]) {
+    const view = { language_id: 1, instrumental: true, instrumental_audio_offset_frames: offset };
+    assert.deepEqual(validateRecordingView(view), { payload: view });
+  }
+  const legacy = { language_id: 1, instrumental: false };
+  assert.deepEqual(validateRecordingView(legacy), { payload: legacy });
+  for (const offset of [null, '12', 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.ok(validateRecordingView({ ...legacy, instrumental_audio_offset_frames: offset }).error);
+  }
+});
+
 const {
   relayAudio,
   expiredTransferIds,
@@ -253,6 +266,27 @@ test('big transfer geometry is validated like audio transfers', () => {
   );
   assert.match(validateBigBegin({ ...begin, sha1: 'A'.repeat(40) }).error, /SHA-1/);
   assert.match(validateBigBegin({ ...begin, _target: 'bad target' }).error, /target/);
+});
+
+test('chunked recording preparations require a bounded active chain', () => {
+  const begin = {
+    transfer_id: 'prepare_1', event: 'recording_prepare', total_bytes: 2,
+    total_chunks: 1, chunk_size: 256 * 1024, sha1: 'a'.repeat(40),
+  };
+  for (const recording_chain of [undefined, null, {},
+    { nextSequence: -1, previousIntegrity: ZERO_INTEGRITY },
+    { nextSequence: 10001, previousIntegrity: ZERO_INTEGRITY },
+    { nextSequence: 2, previousIntegrity: 'invalid' },
+    { nextSequence: 0, previousIntegrity: 'a'.repeat(16) },
+  ]) {
+    assert.match(validateBigBegin({ ...begin, recording_chain }).error, /chain/);
+  }
+  for (const recording_chain of [
+    { nextSequence: 0, previousIntegrity: ZERO_INTEGRITY },
+    { nextSequence: 2130, previousIntegrity: 'a'.repeat(16) },
+  ]) {
+    assert.equal(validateBigBegin({ ...begin, recording_chain }).error, undefined);
+  }
 });
 
 test('big chunks enforce sequential indexes and canonical base64', () => {

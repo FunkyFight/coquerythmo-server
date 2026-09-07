@@ -370,6 +370,49 @@ function bigBegin(overrides = {}) {
   };
 }
 
+test('chunked recording preparation restores the saved chain before clip edits', () => {
+  const { validateRecordingTransaction } = require('../src/recording_protocol');
+  for (const target of [null, 'actor']) {
+    const admin = fakeSocket('admin');
+    const room = createRoom(admin, 'DA', 'saved-project');
+    joinRoom(fakeSocket('actor'), room.code, 'Actor', 'saved-project');
+    const chain = { nextSequence: 2130, previousIntegrity: 'a'.repeat(16) };
+    room.beginBigTransfer(admin, bigBegin({
+      event: 'recording_prepare', recording_chain: chain, _target: target,
+    }));
+    assert.equal(room.getRecordingChain().nextSequence, 0);
+    room.bigChunk(admin, { transfer_id: 'big_1' }, { bytes: 2 });
+    assert.equal(room.endBigTransfer(admin, 'big_1').error, undefined);
+    assert.deepEqual(room.getRecordingChain(), chain);
+    for (const operation of [
+      { op: 'delete_clips', clip_ids: [1] },
+      { op: 'move_clips', placements: [{ clip_id: 2, start_frame: 10 }] },
+      { op: 'add_clip', clip: { id: 3 } },
+    ]) {
+      const expected = room.getRecordingChain();
+      const result = validateRecordingTransaction({
+        sequence: expected.nextSequence,
+        previous_integrity: expected.previousIntegrity,
+        integrity: 'b'.repeat(16), operation,
+      }, expected);
+      assert.equal(result.error, undefined);
+      room.setRecordingChain(result.nextChain);
+    }
+  }
+});
+
+test('incomplete recording preparation leaves the chain unchanged', () => {
+  const admin = fakeSocket('admin');
+  const room = createRoom(admin, 'DA', 'saved-project');
+  const before = room.getRecordingChain();
+  room.beginBigTransfer(admin, bigBegin({
+    event: 'recording_prepare',
+    recording_chain: { nextSequence: 2130, previousIntegrity: 'a'.repeat(16) },
+  }));
+  assert.equal(room.endBigTransfer(admin, 'big_1').error, 'big_transfer_ended_before_completion');
+  assert.deepEqual(room.getRecordingChain(), before);
+});
+
 test('a chunked sync can target one member or broadcast to the room', () => {
   const admin = fakeSocket('admin');
   const actor = fakeSocket('actor');
