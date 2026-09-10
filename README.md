@@ -2,6 +2,11 @@
 
 WebSocket server for coquerythmo cooperative mode.
 
+**Protocol 2 requires the updated client and server together.** The server now
+stores a temporary project archive per room, serves independent actor downloads,
+and keeps versioned bande-rythmo state. Empty rooms release their files and state.
+See [the protocol contract](../docs/network-protocol-v2.md) in the parent project.
+
 ## Quick Start
 
 ```bash
@@ -23,6 +28,9 @@ Environment variables (set before `npm start`):
 | `MOTD` | `` | Message of the day |
 | `SERVER_IP` | *(none)* | External IP/hostname for clients to connect (e.g. `38.87.117.194` or `myserver.com`). If set, included in `/info` response. |
 | `PASSWORD` | *(none)* | Optional server password. If set, clients must provide it. |
+| `PROJECT_CACHE_DIR` | OS temporary directory | Parent of the server's private, marked cache directory. Must have room for the archives. |
+| `PROJECT_MAX_BYTES` | `68719476736` | Maximum project archive size (64 GiB). |
+| `PROJECT_STORAGE_MAX_BYTES` | `137438953472` | Global reservation limit, including incomplete uploads (128 GiB). |
 
 Example (PowerShell):
 ```powershell
@@ -102,22 +110,32 @@ If password is required but wrong/missing, returns HTTP 401:
 
 ## WebSocket Events
 
-See `src/index.js` for full protocol. Main events:
+See `src/index.js` and `src/room_protocol.js` for the protocol. Main events:
 - `ping_server` — **Deprecated** (use HTTP `/info` instead)
 - `create_room` / `join_room` — Room management
-- `request_sync` / `sync` — Project synchronization
-- `command` / `delta` — Real-time collaboration
-- `big_begin` / `big_chunk` / `big_end` — Chunked relay of oversized `sync` and
+- `protocol_request` / `protocol_reply` — Correlated, acknowledged room operations.
+- `project_available` / `project_transfer_request` / `project_transfer_status` — Archive availability and independent download/import progress.
+- `state_changed` — Notification to pull versioned entity changes or a verified snapshot.
+- RPC methods `project_begin/write/commit/read/response/loading/result/abort` — Room archive lifecycle.
+- RPC methods `state_info/publish/pull/upload_begin/upload_chunk/upload_commit/snapshot_begin/snapshot_read/snapshot_end` — Bande-rythmo state.
+- RPC method `event` — Acknowledged recording, audio-relay and room commands, deduplicated across reconnections.
+- `request_sync` — Recording-workspace catch-up from the available director.
+- `big_begin` / `big_chunk` / `big_end` — Chunked relay of oversized
   `recording_prepare` payloads (> 256 KiB serialized; 256 KiB canonical-base64
   chunks, sequential indexes, global SHA-1, 2 GiB cap, 10 min inactivity
   timeout). The server validates and relays without reassembling.
-- Audio/video transfer events
+- Audio transfer events. Project video is distributed inside the project archive.
+
+Uploads expire after ten minutes without activity. Server restart ends ephemeral
+rooms; startup cleans marked caches belonging to stopped processes. WebSocket
+heartbeats detect dead connections without disconnecting healthy receive-only peers.
 
 ## Development
 
 ```bash
 npm install
 npm start
+npm test
 ```
 
 Logs show connections, room activity, and sync requests.

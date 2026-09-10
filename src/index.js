@@ -2,6 +2,12 @@ require('dotenv').config();
 
 const http = require('http');
 const { Server } = require('socket.io');
+const fs = require('node:fs');
+const os = require('node:os');
+const { dispatchCommand, rejectCommand } = require('./command_protocol');
+const { registerProtocolRpc, PROTOCOL_VERSION } = require('./protocol_rpc');
+const { RoomProtocol } = require('./room_protocol');
+const { createCacheDirectory } = require('./cache_directory');
 const { validatePassword } = require('./auth');
 const { createRoom, joinRoom, leaveRoom, getRoom, rooms } = require('./room');
 const {
@@ -9,8 +15,6 @@ const {
   validateAudioStart,
   validateBigBegin,
   validateBigChunk,
-  validateProjectChunk,
-  validateProjectStart,
   validateRecordingDisplaySettings,
   validateRecordingView,
   validateRecordingPrepare,
@@ -34,7 +38,16 @@ const bannedIps = new Set();
 const httpServer = http.createServer();
 const io = new Server(httpServer, {
   cors: { origin: '*' },
-  maxHttpBufferSize: 200 * 1024 * 1024,
+  transports: ['websocket'],
+  maxHttpBufferSize: 1024 * 1024,
+  pingInterval: 15_000,
+  pingTimeout: 30_000,
+});
+
+const cacheRoot = createCacheDirectory(process.env.PROJECT_CACHE_DIR || os.tmpdir());
+const roomProtocol = new RoomProtocol(cacheRoot, (room, event, data) => io.to(room.code).emit(event, data), {
+  maxStorageBytes: Number(process.env.PROJECT_STORAGE_MAX_BYTES || 128 * 1024 ** 3),
+  maxProjectBytes: Number(process.env.PROJECT_MAX_BYTES || 64 * 1024 ** 3),
 });
 
 // HTTP /info endpoint for server browser ping (replaces websocket ping_server)
@@ -54,6 +67,7 @@ httpServer.on('request', (req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     const info = {
+      protocol_version: PROTOCOL_VERSION,
       name: SERVER_NAME,
       motd: MOTD,
       max_slots: MAX_SLOTS,
@@ -67,11 +81,14 @@ httpServer.on('request', (req, res) => {
 });
 
 httpServer.listen(PORT, () => {
-  console.log(`${SERVER_NAME} listening on port ${PORT} (max ${MAX_SLOTS} slots)`);
+  console.log(`${SERVER_NAME} listening on port ${httpServer.address().port} (max ${MAX_SLOTS} slots)`);
 });
 
 // --- Auth via middleware (handshake) ---
 io.use((socket, next) => {
+  if (socket.handshake.auth?.protocol_version !== PROTOCOL_VERSION) {
+    return next(new Error(`Protocol ${PROTOCOL_VERSION} required; update Coquerythmo and its server together`));
+  }
   const address = socket.handshake.address;
   if (bannedIps.has(address)) {
     next(new Error('Banned'));
@@ -91,6 +108,17 @@ io.on('connection', (socket) => {
   socket.username = null;
   socket.roomCode = null;
   socket.audioTransfers = new Map();
+  const commandHandlers = new Map();
+  const onCommand = (event, handler) => {
+    commandHandlers.set(event, handler);
+    socket.on(event, data => {
+      try { handler(data); }
+      catch (error) { socket.emit('server_error', { message: error.message }); }
+    });
+  };
+  registerProtocolRpc(socket, (method, body, id) => method === 'event'
+    ? dispatchCommand(getRoom(socket), socket, id, body, commandHandlers)
+    : roomProtocol.dispatch(getRoom(socket), socket, method, body));
 
   if (process.env.DEBUG) {
     socket.onAny((event, ...args) => {
@@ -101,6 +129,7 @@ io.on('connection', (socket) => {
   // --- Create room ---
   socket.on('create_room', (data) => {
     if (!data || typeof data.username !== 'string' || !data.username.trim()) return;
+    if (!sessionIdFrom(data)) return socket.emit('server_error', { message: 'A session token is required' });
     if (socket.roomCode) return socket.emit('server_error', { message: 'Already in a room' });
     if (typeof data.project_huuid !== 'string' || !data.project_huuid.trim()) {
       return socket.emit('server_error', { message: 'A saved project HUUID is required' });
@@ -115,8 +144,10 @@ io.on('connection', (socket) => {
     socket.username = username;
     const projectHuuid = data.project_huuid.trim().substring(0, 256);
     const room = createRoom(socket, username, projectHuuid, sessionIdFrom(data));
+    roomProtocol.attach(room);
     socket.join(room.code);
     socket.emit('room_created', {
+      protocol_version: PROTOCOL_VERSION,
       code: room.code,
       project_huuid: room.projectHuuid,
       member_id: socket.id,
@@ -128,7 +159,12 @@ io.on('connection', (socket) => {
   // --- Join room ---
   socket.on('join_room', (data) => {
     if (!data || typeof data.username !== 'string' || typeof data.code !== 'string') return;
+    if (!data.username.trim() || !sessionIdFrom(data)) return socket.emit('join_error', { reason: 'invalid_session' });
     if (socket.roomCode) return socket.emit('server_error', { message: 'Already in a room' });
+    if (![...rooms.values()].some(room => [...room.members.values()].some(member => member.sessionId === sessionIdFrom(data)))
+      && [...rooms.values()].reduce((total, room) => total + room.members.size, 0) >= MAX_SLOTS) {
+      return socket.emit('join_error', { reason: 'server_full' });
+    }
     const username = data.username.trim().substring(0, 32);
     const code = data.code.trim().toUpperCase();
     socket.username = username;
@@ -148,6 +184,7 @@ io.on('connection', (socket) => {
 
     socket.join(room.code);
     socket.emit('room_joined', {
+      protocol_version: PROTOCOL_VERSION,
       code: room.code,
       role: result.role,
       members: room.getMemberUsernames(),
@@ -159,26 +196,7 @@ io.on('connection', (socket) => {
     });
     socket.to(room.code).emit('member_joined', { username });
     emitRoomState(room);
-    // A transfer request is still created by the director, preserving the
-    // existing permission and checksum flow. The event merely asks the
-    // director client to start it automatically for this invitation.
-    if (effectiveProjectMode === 'auto_transfer') {
-      room.adminEntry()?.[0].emit('project_transfer_auto_request', {
-        member_id: socket.id,
-      });
-    }
-    if (result.reconnected) {
-      if (result.reconnected.restarted) {
-        emitProjectTransferRequests(room);
-      } else if (room.projectTransfer?.phase === 'collecting') {
-        emitProjectTransferRequest(
-          socket,
-          room.projectTransfer,
-          room.adminEntry()?.[1]?.id,
-        );
-      }
-      emitProjectTransferStatus(room);
-    }
+    roomProtocol.join(room, socket);
     console.log(`[room] ${username} joined room ${code}`);
   });
 
@@ -187,29 +205,10 @@ io.on('connection', (socket) => {
     handleLeave(socket);
   });
 
-  // --- Command broadcast ---
-  socket.on('command', (data) => {
-    if (!data || typeof data.payload !== 'object') return;
-    const room = getRoom(socket);
-    if (!room) return socket.emit('server_error', { message: 'Not in a room' });
-    socket.to(room.code).emit('remote_command', {
-      from: socket.username,
-      payload: data.payload,
-    });
-  });
-
-  // Delta: lightweight command relay
-  socket.on('delta', (data) => {
-    if (!data) return;
-    const room = getRoom(socket);
-    if (!room) return;
-    socket.to(room.code).emit('delta', data);
-  });
-
   // --- Sync request ---
-  socket.on('request_sync', () => {
+  onCommand('request_sync', () => {
     const room = getRoom(socket);
-    if (!room) return socket.emit('server_error', { message: 'Not in a room' });
+    if (!room) return rejectCommand({ message: 'Not in a room' });
     console.log(`[sync] ${socket.username} requests sync`);
     for (const [memberSocket, member] of room.members) {
       if (member.role === 'admin' && memberSocket !== socket) {
@@ -221,36 +220,18 @@ io.on('connection', (socket) => {
     console.log('[sync] No admin found');
     // Surface the failure instead of letting the requester wait forever on a
     // sync that can never arrive.
-    socket.emit('server_error', { message: 'No director available to synchronize' });
-  });
-
-  // --- Sync data (admin -> specific requester or broadcast) ---
-  socket.on('sync', (data) => {
-    const room = getRoom(socket);
-    if (!room) return;
-    console.log(`[sync] ${socket.username} sent sync data`);
-    if (data?._target !== undefined) {
-      const targetSocket = memberSocketInRoom(room, data._target);
-      if (!targetSocket) {
-        return socket.emit('server_error', { message: 'Invalid sync target' });
-      }
-      const payload = { ...data };
-      delete payload._target;
-      targetSocket.emit('sync', payload);
-    } else {
-      socket.to(room.code).emit('sync', data);
-    }
+    rejectCommand({ message: 'No director available to synchronize' });
   });
 
   // Recording-workspace changes are authorized independently from the
   // existing bande-rythmo collaboration protocol. Only the DA or the Co-DA
   // currently holding control may mutate or drive playback.
-  socket.on('recording_transaction', (data) => {
+  onCommand('recording_transaction', (data) => {
     const room = controlledRecordingRoom(socket);
     if (!room) return;
     const validation = validateRecordingTransaction(data, room.getRecordingChain());
     if (validation.error) {
-      return socket.emit('server_error', {
+      return rejectCommand({
         message: `Invalid recording transaction: ${validation.error}`,
       });
     }
@@ -258,19 +239,19 @@ io.on('connection', (socket) => {
     socket.to(room.code).emit('recording_transaction', data);
   });
 
-  socket.on('recording_prepare', (data) => {
+  onCommand('recording_prepare', (data) => {
     const room = controlledRecordingRoom(socket);
     if (!room) return;
     const target = data?._target;
     const targetSocket = target === undefined ? null : memberSocketInRoom(room, target);
     if (target !== undefined && !targetSocket) {
-      return socket.emit('server_error', { message: 'Invalid recording preparation target' });
+      return rejectCommand({ message: 'Invalid recording preparation target' });
     }
     const payload = { ...data };
     delete payload._target;
     const validation = validateRecordingPrepare(payload);
     if (validation.error) {
-      return socket.emit('server_error', {
+      return rejectCommand({
         message: `Invalid recording preparation: ${validation.error}`,
       });
     }
@@ -285,21 +266,21 @@ io.on('connection', (socket) => {
   // Chunked relay for payloads too large for a single websocket frame. The
   // server validates geometry and ordering, then relays each frame untouched:
   // reassembly and integrity checks happen on the receiving client.
-  socket.on('big_begin', (data) => {
+  onCommand('big_begin', (data) => {
     const room = getRoom(socket);
-    if (!room) return socket.emit('server_error', { message: 'Not in a room' });
+    if (!room) return rejectCommand({ message: 'Not in a room' });
     const validation = validateBigBegin(data);
     if (validation.error) {
-      return socket.emit('server_error', { message: `Invalid big transfer: ${validation.error}` });
+      return rejectCommand({ message: `Invalid big transfer: ${validation.error}` });
     }
     const result = room.beginBigTransfer(socket, data);
-    if (result.error) return socket.emit('server_error', { message: result.error });
+    if (result.error) return rejectCommand({ message: result.error });
     relayBigEvent(room, socket, 'big_begin', data, result.transfer.targetMemberId);
   });
 
-  socket.on('big_chunk', (data) => {
+  onCommand('big_chunk', (data) => {
     const room = getRoom(socket);
-    if (!room) return socket.emit('server_error', { message: 'Not in a room' });
+    if (!room) return rejectCommand({ message: 'Not in a room' });
     const transfer = room.bigTransfers.get(data?.transfer_id);
     const validation = validateBigChunk(data, transfer);
     const result = room.bigChunk(socket, data, validation);
@@ -307,47 +288,50 @@ io.on('connection', (socket) => {
       // A protocol error aborts the transfer: the sender must start over
       // with a fresh big_begin instead of guessing the remaining state.
       if (transfer) room.bigTransfers.delete(data.transfer_id);
-      return socket.emit('server_error', { message: `Invalid big chunk: ${result.error}` });
+      return rejectCommand({ message: `Invalid big chunk: ${result.error}` });
     }
     relayBigEvent(room, socket, 'big_chunk', data, result.transfer.targetMemberId);
   });
 
-  socket.on('big_end', (data) => {
+  onCommand('big_end', (data) => {
     const room = getRoom(socket);
-    if (!room) return socket.emit('server_error', { message: 'Not in a room' });
+    if (!room) return rejectCommand({ message: 'Not in a room' });
     if (typeof data?.transfer_id !== 'string') {
-      return socket.emit('server_error', { message: 'Invalid big transfer id' });
+      return rejectCommand({ message: 'Invalid big transfer id' });
     }
     const result = room.endBigTransfer(socket, data.transfer_id);
-    if (result.error) return socket.emit('server_error', { message: result.error });
+    if (result.error) return rejectCommand({ message: result.error });
     relayBigEvent(room, socket, 'big_end', data, result.transfer.targetMemberId);
   });
 
-  socket.on('recording_capture', (data) => {
+  onCommand('recording_capture', (data) => {
     const room = controlledRecordingRoom(socket);
     if (!room) return;
     if (!Number.isSafeInteger(data?.current_frame) || data.current_frame < 0
       || (data.capture_target !== null && typeof data.capture_target !== 'object')) {
-      return socket.emit('server_error', { message: 'Invalid recording capture command' });
+      return rejectCommand({ message: 'Invalid recording capture command' });
     }
     socket.to(room.code).emit('recording_capture', data);
   });
 
-  socket.on('recording_playback', (data) => {
+  onCommand('recording_playback', (data) => {
     const room = controlledRecordingRoom(socket);
     if (!room) return;
+    if (!Number.isSafeInteger(data?.frame) || data.frame < 0 || typeof data?.playing !== 'boolean') {
+      return rejectCommand({ message: 'Invalid recording playback state' });
+    }
     socket.to(room.code).emit('recording_playback', data);
   });
 
-  socket.on('recording_view', (data) => {
+  onCommand('recording_view', (data) => {
     const room = getRoom(socket);
     const caller = room?.memberForSocket(socket);
-    if (!room || caller?.role !== 'admin') return;
+    if (!room || caller?.role !== 'admin') return rejectCommand({ message: 'director_required' });
     const target = data?._target;
     const targetSocket = target === undefined ? null : memberSocketInRoom(room, target);
     const validation = validateRecordingView(data);
     if (validation.error || (target !== undefined && !targetSocket)) {
-      return socket.emit('server_error', { message: 'Invalid recording view' });
+      return rejectCommand({ message: 'Invalid recording view' });
     }
     const payload = validation.payload;
     if (targetSocket) {
@@ -357,15 +341,15 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('recording_ready', (data) => {
+  onCommand('recording_ready', (data) => {
     const room = getRoom(socket);
     if (!room?.setRecordingReady(socket, data?.ready)) {
-      return socket.emit('server_error', { message: 'Invalid recording readiness' });
+      return rejectCommand({ message: 'Invalid recording readiness' });
     }
     emitRoomState(room);
   });
 
-  socket.on('set_project_invitation_mode', (data) => {
+  onCommand('set_project_invitation_mode', (data) => {
     const room = getRoom(socket);
     const mode = ['none', 'require_match', 'auto_transfer'].includes(data?.project_mode)
       ? data.project_mode : null;
@@ -373,21 +357,21 @@ io.on('connection', (socket) => {
       ? data.project_file_name.trim().substring(0, 256) : null;
     if (!room || !mode || (mode !== 'none' && (!fileName || !fileName.toLowerCase().endsWith('.coquerythmo')))
       || !room.setProjectInvitationMode(socket, mode, fileName)) {
-      return socket.emit('server_error', { message: 'Invalid project invitation mode' });
+      return rejectCommand({ message: 'Invalid project invitation mode' });
     }
     emitRoomState(room);
   });
 
-  socket.on('actor_request', (data) => {
+  onCommand('actor_request', (data) => {
     const room = getRoom(socket);
     const caller = room?.memberForSocket(socket);
-    if (!room || caller?.role !== 'admin') return;
+    if (!room || caller?.role !== 'admin') return rejectCommand({ message: 'director_required' });
     if (data?.action === 'open_microphone') {
       socket.to(room.code).emit('actor_request', { action: 'open_microphone' });
     } else if (data?.action === 'apply_display_settings') {
       const settings = validateRecordingDisplaySettings(data);
       if (settings.error) {
-        return socket.emit('server_error', { message: settings.error });
+        return rejectCommand({ message: settings.error });
       }
       socket.to(room.code).emit('actor_request', {
         action: 'apply_display_settings',
@@ -397,161 +381,31 @@ io.on('connection', (socket) => {
       socket.to(room.code).emit('actor_request', {
         action: 'close_project_transfer_waiting',
       });
-      if (room.closeProjectTransferWaiting()) emitProjectTransferStatus(room);
+      roomProtocol.attach(room).distribution.closeWaiting();
+      roomProtocol.status(room, true);
     }
   });
 
-  socket.on('project_transfer_request', (data) => {
-    const room = getRoom(socket);
-    const validation = validateProjectStart(data);
-    if (!room || validation.error) {
-      return socket.emit('server_error', {
-        message: `Invalid project transfer: ${validation.error || 'not in a room'}`,
-      });
-    }
-    const result = room.beginProjectTransfer(socket, data);
-    if (result.error) return socket.emit('server_error', { message: result.error });
-    for (const participant of Object.values(result.transfer.participants)) {
-      emitProjectTransferRequest(participant.socket, result.transfer, room.memberForSocket(socket).id);
-    }
-    emitProjectTransferStatus(room);
-  });
-
-  socket.on('project_transfer_response', (data) => {
-    const room = getRoom(socket);
-    const response = typeof data?.response === 'string' ? data.response : '';
-    const result = room?.projectTransferResponse(socket, data?.request_id, response);
-    if (!result || result.error) {
-      if (room?.projectTransfer && (room.projectTransferForSocket(socket)
-        || room.memberForSocket(socket)?.role === 'admin')) {
-        room.cancelProjectTransfer('protocol_error');
-        emitProjectTransferStatus(room);
-      }
-      return socket.emit('server_error', { message: result?.error || 'Not in a room' });
-    }
-    emitProjectTransferStatus(room);
-    if (result.transfer.phase === 'transferring') {
-      room.adminEntry()?.[0].emit('project_transfer_ready', {
-        request_id: result.transfer.requestId,
-        metadata: result.transfer.metadata,
-      });
-    }
-  });
-
-  socket.on('project_transfer_start', (data) => {
-    const room = getRoom(socket);
-    const validation = validateProjectStart(data);
-    const result = room?.startProjectTransferStream(socket, data);
-    if (!result || result.error || validation.error) {
-      if (room?.projectTransfer && room.memberForSocket(socket)?.role === 'admin') {
-        room.cancelProjectTransfer('protocol_error');
-        emitProjectTransferStatus(room);
-      }
-      return socket.emit('server_error', {
-        message: result?.error || validation.error || 'Not in a room',
-      });
-    }
-    emitProjectTransferStatus(room);
-  });
-
-  socket.on('project_transfer_chunk', (data) => {
-    const room = getRoom(socket);
-    const transfer = room?.projectTransfer;
-    const validation = validateProjectChunk(data, transfer && {
-      requestId: transfer.requestId,
-      nextIndex: transfer.nextIndex,
-      chunkSize: transfer.metadata.chunk_size,
-      receivedBytes: transfer.receivedBytes,
-      totalBytes: transfer.metadata.total_bytes,
-    });
-    const result = room?.projectTransferChunk(socket, data, validation);
-    if (!result || result.error) {
-      if (room?.projectTransfer && room.memberForSocket(socket)?.role === 'admin') {
-        room.cancelProjectTransfer('protocol_error');
-        emitProjectTransferStatus(room);
-      }
-      return socket.emit('server_error', {
-        message: result?.error || validation.error || 'Not in a room',
-      });
-    }
-    for (const memberId of result.transfer.acceptedIds || []) {
-      const participant = result.transfer.participants[memberId];
-      if (participant?.response === 'receiving' && participant.socket) participant.socket.emit('project_transfer_chunk', data);
-    }
-    emitProjectTransferStatus(room);
-  });
-
-  socket.on('project_transfer_end', (data) => {
-    const room = getRoom(socket);
-    const result = room?.finishProjectTransferStream(socket, data?.request_id);
-    if (!result || result.error) {
-      if (room?.projectTransfer && room.memberForSocket(socket)?.role === 'admin') {
-        room.cancelProjectTransfer('protocol_error');
-        emitProjectTransferStatus(room);
-      }
-      return socket.emit('server_error', { message: result?.error || 'Not in a room' });
-    }
-    if (result.restarted) {
-      emitProjectTransferStatus(room);
-      emitProjectTransferRequests(room);
-      return;
-    }
-    for (const memberId of result.transfer.acceptedIds || []) {
-      const participant = result.transfer.participants[memberId];
-      if (participant?.socket) participant.socket.emit('project_transfer_end', {
-        request_id: result.transfer.requestId,
-      });
-    }
-    emitProjectTransferStatus(room);
-  });
-
-  socket.on('project_transfer_loading', (data) => {
-    const room = getRoom(socket);
-    const result = room?.projectTransferLoading(socket, data?.request_id);
-    if (!result || result.error) {
-      return socket.emit('server_error', { message: result?.error || 'Not in a room' });
-    }
-    emitProjectTransferStatus(room);
-  });
-
-  socket.on('project_transfer_result', (data) => {
-    const room = getRoom(socket);
-    const result = room?.projectTransferResult(
-      socket,
-      data?.request_id,
-      data?.success === true,
-      data?.error,
-    );
-    if (!result || result.error) {
-      if (room?.projectTransfer) {
-        room.cancelProjectTransfer('protocol_error');
-        emitProjectTransferStatus(room);
-      }
-      return socket.emit('server_error', { message: result?.error || 'Not in a room' });
-    }
-    emitProjectTransferStatus(room);
-  });
-
-  socket.on('set_co_director', (data) => {
+  onCommand('set_co_director', (data) => {
     const room = getRoom(socket);
     const caller = room?.memberForSocket(socket);
-    if (!room || caller?.role !== 'admin') return;
+    if (!room || caller?.role !== 'admin') return rejectCommand({ message: 'director_required' });
     if (typeof data?.member_id !== 'string') return;
     if (room.setCoDirector(data.member_id, Boolean(data.enabled))) emitRoomState(room);
   });
 
-  socket.on('grant_recording_control', (data) => {
+  onCommand('grant_recording_control', (data) => {
     const room = getRoom(socket);
     const caller = room?.memberForSocket(socket);
-    if (!room || caller?.role !== 'admin') return;
+    if (!room || caller?.role !== 'admin') return rejectCommand({ message: 'director_required' });
     if (typeof data?.member_id !== 'string') return;
     if (room.setControlOwner(data.member_id)) emitRoomState(room);
   });
 
-  socket.on('set_member_muted', (data) => {
+  onCommand('set_member_muted', (data) => {
     const room = getRoom(socket);
     const caller = room?.memberForSocket(socket);
-    if (!room || caller?.role !== 'admin') return;
+    if (!room || caller?.role !== 'admin') return rejectCommand({ message: 'director_required' });
     const entry = typeof data?.member_id === 'string'
       ? room.memberEntryById(data.member_id)
       : null;
@@ -560,10 +414,10 @@ io.on('connection', (socket) => {
     emitRoomState(room);
   });
 
-  socket.on('kick_member', (data) => {
+  onCommand('kick_member', (data) => {
     const room = getRoom(socket);
     const caller = room?.memberForSocket(socket);
-    if (!room || caller?.role !== 'admin') return;
+    if (!room || caller?.role !== 'admin') return rejectCommand({ message: 'director_required' });
     const entry = typeof data?.member_id === 'string'
       ? room.memberEntryById(data.member_id)
       : null;
@@ -572,10 +426,10 @@ io.on('connection', (socket) => {
     entry[0].disconnect(true);
   });
 
-  socket.on('ban_member_ip', (data) => {
+  onCommand('ban_member_ip', (data) => {
     const room = getRoom(socket);
     const caller = room?.memberForSocket(socket);
-    if (!room || caller?.role !== 'admin') return;
+    if (!room || caller?.role !== 'admin') return rejectCommand({ message: 'director_required' });
     const entry = typeof data?.member_id === 'string'
       ? room.memberEntryById(data.member_id)
       : null;
@@ -588,30 +442,30 @@ io.on('connection', (socket) => {
   // FLAC files are transferred in bounded chunks. Socket.IO preserves event
   // order, while transfer_id/index/size/checksum let receivers reject a
   // truncated or interleaved upload before exposing it as a clip.
-  socket.on('audio_start', (data) => {
+  onCommand('audio_start', (data) => {
     const room = getRoom(socket);
     const member = room?.memberForSocket(socket);
-    if (!room || !member) return socket.emit('server_error', { message: 'Not in a room' });
+    if (!room || !member) return rejectCommand({ message: 'Not in a room' });
     const isAssetPublication = data?.commit_on_receive === false;
     if (isAssetPublication && !room.canControl(socket)) {
-      return socket.emit('server_error', { message: 'Recording control is read-only' });
+      return rejectCommand({ message: 'Recording control is read-only' });
     }
     if (member.muted && !isAssetPublication) {
-      return socket.emit('server_error', { message: 'Audio input is muted' });
+      return rejectCommand({ message: 'Audio input is muted' });
     }
     if (socket.audioTransfers.size >= MAX_ACTIVE_AUDIO_TRANSFERS) {
-      return socket.emit('server_error', { message: 'Another audio transfer is already active' });
+      return rejectCommand({ message: 'Another audio transfer is already active' });
     }
     const validation = validateAudioStart(data);
     if (validation.error) {
-      return socket.emit('server_error', { message: `Invalid audio transfer: ${validation.error}` });
+      return rejectCommand({ message: `Invalid audio transfer: ${validation.error}` });
     }
     const targetMemberId = data.to_member_id || null;
     if (targetMemberId && !isAssetPublication) {
-      return socket.emit('server_error', { message: 'Recorded takes cannot target one recipient' });
+      return rejectCommand({ message: 'Recorded takes cannot target one recipient' });
     }
     if (targetMemberId && !memberSocketInRoom(room, targetMemberId)) {
-      return socket.emit('server_error', { message: 'Invalid audio recipient' });
+      return rejectCommand({ message: 'Invalid audio recipient' });
     }
     if (socket.audioTransfers.has(data.transfer_id)) return;
     socket.audioTransfers.set(data.transfer_id, {
@@ -632,14 +486,14 @@ io.on('connection', (socket) => {
     );
   });
 
-  socket.on('audio_chunk', (data) => {
+  onCommand('audio_chunk', (data) => {
     const room = getRoom(socket);
     const member = room?.memberForSocket(socket);
-    if (!room || !member) return socket.emit('server_error', { message: 'Not in a room' });
+    if (!room || !member) return rejectCommand({ message: 'Not in a room' });
     const transfer = socket.audioTransfers.get(data?.transfer_id);
     const validation = validateAudioChunk(data, transfer);
     if (validation.error) {
-      return socket.emit('server_error', { message: `Invalid audio chunk: ${validation.error}` });
+      return rejectCommand({ message: `Invalid audio chunk: ${validation.error}` });
     }
     transfer.nextIndex += 1;
     transfer.receivedBytes += validation.bytes;
@@ -647,45 +501,22 @@ io.on('connection', (socket) => {
     relayAudio(room, socket, 'audio_chunk', data, transfer.targetMemberId);
   });
 
-  socket.on('audio_end', (data) => {
+  onCommand('audio_end', (data) => {
     const room = getRoom(socket);
     const member = room?.memberForSocket(socket);
-    if (!room || !member) return socket.emit('server_error', { message: 'Not in a room' });
+    if (!room || !member) return rejectCommand({ message: 'Not in a room' });
     if (typeof data?.transfer_id !== 'string') {
-      return socket.emit('server_error', { message: 'Invalid audio transfer id' });
+      return rejectCommand({ message: 'Invalid audio transfer id' });
     }
     const transfer = socket.audioTransfers.get(data.transfer_id);
-    if (!transfer) return socket.emit('server_error', { message: 'Unknown audio transfer' });
+    if (!transfer) return rejectCommand({ message: 'Unknown audio transfer' });
     socket.audioTransfers.delete(data.transfer_id);
     if (transfer.nextIndex !== transfer.totalChunks
       || transfer.receivedBytes !== transfer.totalBytes) {
-      return socket.emit('server_error', { message: 'Audio transfer ended before completion' });
+      return rejectCommand({ message: 'Audio transfer ended before completion' });
     }
     relayAudio(room, socket, 'audio_end', data, transfer.targetMemberId);
     socket.emit('audio_uploaded', { transfer_id: data.transfer_id });
-  });
-
-  // --- Chunked video relay ---
-  socket.on('video_start', (data) => {
-    if (!data || typeof data.filename !== 'string' || typeof data.total_chunks !== 'number') return;
-    const room = getRoom(socket);
-    if (!room) return;
-    console.log(`[video] ${socket.username} sending video: ${data.filename} (${data.total_chunks} chunks)`);
-    socket.to(room.code).emit('video_start', data);
-  });
-
-  socket.on('video_chunk', (data) => {
-    if (!data || data.index === undefined) return;
-    const room = getRoom(socket);
-    if (!room) return;
-    socket.to(room.code).emit('video_chunk', data);
-  });
-
-  socket.on('video_end', (data) => {
-    const room = getRoom(socket);
-    if (!room) return;
-    console.log(`[video] Transfer complete`);
-    socket.to(room.code).emit('video_end', data);
   });
 
   // --- Disconnect ---
@@ -704,7 +535,7 @@ function handleLeave(socket) {
     console.log(`[room] ${result.member.username} left room`);
     if (!result.room.isEmpty()) {
       emitRoomState(result.room);
-      if (result.room.projectTransfer) emitProjectTransferStatus(result.room);
+      roomProtocol.status(result.room, true);
     }
   }
 }
@@ -714,49 +545,6 @@ function emitRoomState(room) {
     members: room.getMemberList(),
     control_owner_id: room.controlOwnerId,
   });
-}
-
-function projectTransferStatus(room) {
-  const transfer = room.projectTransfer;
-  if (!transfer) return null;
-  return {
-    request_id: transfer.requestId,
-    phase: transfer.phase,
-    total_bytes: transfer.metadata.total_bytes,
-    transferred_bytes: transfer.receivedBytes,
-    participants: Object.values(transfer.participants).map(participant => ({
-      member_id: participant.memberId,
-      username: participant.username,
-      response: participant.response,
-      progress: participant.progress,
-      deadline: participant.deadline,
-      error: participant.error,
-    })),
-    cancel_reason: transfer.cancelReason,
-  };
-}
-
-function emitProjectTransferStatus(room) {
-  const payload = projectTransferStatus(room);
-  if (payload) io.to(room.code).emit('project_transfer_status', payload);
-}
-
-function emitProjectTransferRequest(socket, transfer, fromMemberId) {
-  socket.emit('project_transfer_request', {
-    ...transfer.metadata,
-    from_member_id: fromMemberId,
-  });
-}
-
-function emitProjectTransferRequests(room) {
-  const transfer = room.projectTransfer;
-  if (!transfer) return;
-  const fromMemberId = room.adminEntry()?.[1]?.id;
-  for (const participant of Object.values(transfer.participants)) {
-    if (participant.socket && participant.response === 'pending') {
-      emitProjectTransferRequest(participant.socket, transfer, fromMemberId);
-    }
-  }
 }
 
 function memberSocketInRoom(room, memberId) {
@@ -784,11 +572,11 @@ function sessionIdFrom(data) {
 function controlledRecordingRoom(socket) {
   const room = getRoom(socket);
   if (!room) {
-    socket.emit('server_error', { message: 'Not in a room' });
+    rejectCommand({ message: 'Not in a room' });
     return null;
   }
   if (!room.canControl(socket)) {
-    socket.emit('server_error', { message: 'Recording control is read-only' });
+    rejectCommand({ message: 'Recording control is read-only' });
     return null;
   }
   return room;
@@ -809,8 +597,13 @@ function expireAudioTransfers() {
     }
   }
   for (const [, room] of rooms) {
-    const changed = room.expireProjectTransferResponses(now) || room.expireProjectTransfer(now);
-    if (changed) emitProjectTransferStatus(room);
+    roomProtocol.attach(room).state.expire(now);
+    roomProtocol.attach(room).store.expire(now).then(expired => {
+      if (expired) {
+        room.networkServices.distribution.error = 'upload_inactivity';
+        roomProtocol.status(room, true);
+      }
+    }).catch(error => console.error('[project-cache]', error.message));
     for (const expired of room.expireBigTransfers(now, BIG_TRANSFER_TIMEOUT)) {
       const sender = room.memberEntryById(expired.senderId);
       sender?.[0].emit('server_error', {
@@ -822,6 +615,23 @@ function expireAudioTransfers() {
 
 // Socket.IO's heartbeat owns liveness. This timer only expires bounded
 // transfer state and never disconnects a healthy client that is only receiving.
-setInterval(() => {
+const transferTimer = setInterval(() => {
   expireAudioTransfers();
 }, 60 * 1000); // check every minute
+transferTimer.unref();
+
+async function shutdown() {
+  clearInterval(transferTimer);
+  const activeRooms = [...rooms.values()];
+  await new Promise(resolve => io.close(resolve));
+  await Promise.all(activeRooms.map(room => room.cleanup || room.dispose?.()));
+  await fs.promises.rm(cacheRoot, { recursive: true, force: true });
+}
+
+if (require.main === module) {
+  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {
+    shutdown().then(() => process.exit(0), error => { console.error(error); process.exit(1); });
+  });
+}
+
+module.exports = { httpServer, io, roomProtocol, cacheRoot, shutdown };
